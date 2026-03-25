@@ -1,0 +1,7 @@
+# Dossiers
+browsers/
+configs/
+
+# Binaires et journaux
+*.exe
+*.log

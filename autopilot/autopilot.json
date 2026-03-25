@@ -1,0 +1,32 @@
+{
+  "schedules": [
+    {
+      "name": "Bots semaine",
+      "days": "mon-fri",
+      "from": "00:00",
+      "to": "17:00",
+      "config": "C:/Users/User/Desktop/SnowMaster/botting.json"
+    },
+        {
+      "name": "Bots semaine",
+      "days": "mon-fri",
+      "from": "00:00",
+      "to": "17:00",
+      "config": "C:/Users/User/Desktop/SnowMaster/botting.json"
+    },
+        {
+      "name": "Bots semaine",
+      "days": "mon-fri",
+      "from": "00:00",
+      "to": "17:00",
+      "config": "C:/Users/User/Desktop/SnowMaster/botting.json"
+    },
+    {
+      "name": "Vidage",
+      "days": "mon-fri",
+      "from": "17:00",
+      "to": "23:59",
+      "config": "C:/Users/User/Desktop/SnowMaster/vidage.json"
+    }
+  ]
+}
