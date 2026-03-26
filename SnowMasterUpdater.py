@@ -295,6 +295,12 @@ class RoundedButton(tk.Canvas):
     def set_command(self, command):
         self._command = command
 
+    def set_palette(self, bg: str, bg_hover: str, bg_disabled: str = "#334155"):
+        self._bg = bg
+        self._bg_hover = bg_hover
+        self._bg_disabled = bg_disabled
+        self._draw(self._bg if self._enabled else self._bg_disabled)
+
 
 def _replace_exe(target: str, tmp_dl: str) -> None:
     target = os.path.abspath(target)
@@ -364,7 +370,7 @@ class UpdaterApp:
         self.root = tk.Tk()
         self.root.title(f"Mise à jour — {self.app_name}")
         self.root.resizable(False, False)
-        self.root.minsize(460, 190)
+        self.root.minsize(520, 230)
         self.root.configure(bg="#0B1220")
 
         self._progress_q: queue.Queue = queue.Queue()
@@ -379,13 +385,13 @@ class UpdaterApp:
             "SnowTitle.TLabel",
             background="#0B1220",
             foreground="#E6F2FF",
-            font=("Segoe UI", 13, "bold"),
+            font=("Segoe UI", 17, "bold"),
         )
         style.configure(
             "SnowInfo.TLabel",
             background="#0B1220",
             foreground="#93C5FD",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 12),
         )
         style.configure(
             "Snow.Horizontal.TProgressbar",
@@ -420,9 +426,11 @@ class UpdaterApp:
             btn_row,
             text="UPDATE",
             command=self._on_install,
-            width=180,
-            height=44,
-            radius=16,
+            width=230,
+            height=54,
+            radius=18,
+            bg="#16A34A",
+            bg_hover="#22C55E",
         )
         self.btn_install.pack()
 
@@ -468,7 +476,10 @@ class UpdaterApp:
         if not murl:
             self.lbl_title.configure(text="Configuration incomplète")
             self._set_body("Configuration des mises à jour manquante.")
-            self.btn_install.set_enabled(False)
+            self.btn_install.set_text("FERMER")
+            self.btn_install.set_command(self.root.destroy)
+            self.btn_install.set_palette("#334155", "#475569")
+            self.btn_install.set_enabled(True)
             return
 
         self.manifest_url = murl
@@ -483,13 +494,19 @@ class UpdaterApp:
         except Exception as e:
             self.lbl_title.configure(text="Vérification impossible")
             self._set_body(f"Impossible de joindre le serveur ({e}).")
-            self.btn_install.set_enabled(False)
+            self.btn_install.set_text("FERMER")
+            self.btn_install.set_command(self.root.destroy)
+            self.btn_install.set_palette("#334155", "#475569")
+            self.btn_install.set_enabled(True)
             return
 
         if not remote or not durl:
             self.lbl_title.configure(text="Manifest invalide")
             self._set_body("Manifest invalide.")
-            self.btn_install.set_enabled(False)
+            self.btn_install.set_text("FERMER")
+            self.btn_install.set_command(self.root.destroy)
+            self.btn_install.set_palette("#334155", "#475569")
+            self.btn_install.set_enabled(True)
             return
 
         self.remote_build_id = remote
@@ -504,6 +521,9 @@ class UpdaterApp:
             self._set_body(
                 "SnowMaster.exe est introuvable. Cliquez UPDATE pour réinstaller."
             )
+            self.btn_install.set_text("UPDATE")
+            self.btn_install.set_command(self._on_install)
+            self.btn_install.set_palette("#16A34A", "#22C55E")
             self.btn_install.set_enabled(True)
             return
 
@@ -512,13 +532,19 @@ class UpdaterApp:
         if not self.local_build_id:
             self.lbl_title.configure(text="Vérification impossible")
             self._set_body("Version locale introuvable.")
-            self.btn_install.set_enabled(False)
+            self.btn_install.set_text("FERMER")
+            self.btn_install.set_command(self.root.destroy)
+            self.btn_install.set_palette("#334155", "#475569")
+            self.btn_install.set_enabled(True)
             return
 
         if self.local_build_id == self.remote_build_id:
             self.lbl_title.configure(text="Logiciel à jour")
             self._set_body(f"{self.app_name} est à jour.")
-            self.btn_install.set_enabled(False)
+            self.btn_install.set_text("FERMER")
+            self.btn_install.set_command(self.root.destroy)
+            self.btn_install.set_palette("#334155", "#475569")
+            self.btn_install.set_enabled(True)
             return
 
         self._show_update_available_ui()
@@ -526,6 +552,9 @@ class UpdaterApp:
     def _show_update_available_ui(self) -> None:
         self.lbl_title.configure(text="Mise à jour disponible")
         self._set_body("Une mise à jour est disponible.")
+        self.btn_install.set_text("UPDATE")
+        self.btn_install.set_command(self._on_install)
+        self.btn_install.set_palette("#16A34A", "#22C55E")
         self.btn_install.set_enabled(True)
 
     def _on_install(self) -> None:
@@ -608,6 +637,9 @@ class UpdaterApp:
                             f"La mise à jour n'a pas pu être finalisée ({e})."
                         )
                         self.lbl_progress.configure(text="")
+                        self.btn_install.set_text("FERMER")
+                        self.btn_install.set_command(self.root.destroy)
+                        self.btn_install.set_palette("#334155", "#475569")
                         self.btn_install.set_enabled(True)
                         reschedule = False
                         return
@@ -622,6 +654,9 @@ class UpdaterApp:
                         pass
                     self.lbl_progress.configure(text="")
                     self._set_body(f"La mise à jour a échoué ({a}).")
+                    self.btn_install.set_text("FERMER")
+                    self.btn_install.set_command(self.root.destroy)
+                    self.btn_install.set_palette("#334155", "#475569")
                     self.btn_install.set_enabled(True)
                     reschedule = False
                     return
