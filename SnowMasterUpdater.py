@@ -288,6 +288,13 @@ class RoundedButton(tk.Canvas):
         self._enabled = bool(enabled)
         self._draw(self._bg if self._enabled else self._bg_disabled)
 
+    def set_text(self, text: str):
+        self._text = str(text)
+        self._draw(self._bg if self._enabled else self._bg_disabled)
+
+    def set_command(self, command):
+        self._command = command
+
 
 def _replace_exe(target: str, tmp_dl: str) -> None:
     target = os.path.abspath(target)
@@ -438,6 +445,12 @@ class UpdaterApp:
             return _manifest_url_from_repo(repo_env)
         return _manifest_url_from_repo(UPDATE_GITHUB_REPO)
 
+    def _is_target_exe_present(self) -> bool:
+        try:
+            return os.path.isfile(self.target_exe)
+        except Exception:
+            return False
+
     def _apply_state_from_args_or_fetch(self) -> None:
         if self.download_url and self.remote_build_id:
             try:
@@ -483,6 +496,16 @@ class UpdaterApp:
         self.download_url = durl
         if not self.local_build_id:
             self.local_build_id = _read_local_build_id(self.target_exe)
+
+        # Sécurité : si l'exe principal est absent, proposer une réinstallation
+        # au lieu d'afficher "à jour".
+        if not self._is_target_exe_present():
+            self.lbl_title.configure(text="Application introuvable")
+            self._set_body(
+                "SnowMaster.exe est introuvable. Cliquez UPDATE pour réinstaller."
+            )
+            self.btn_install.set_enabled(True)
+            return
 
         # Si l'ID local est inconnu (ex: lancement standalone sans metadata locale),
         # on évite les faux positifs de mise à jour.
@@ -571,6 +594,9 @@ class UpdaterApp:
                             "Mise à jour terminée. Relance manuelle de SnowMaster."
                         )
                         self.lbl_progress.configure(text="")
+                        self.btn_install.set_text("FERMER")
+                        self.btn_install.set_command(self.root.destroy)
+                        self.btn_install.set_enabled(True)
                         reschedule = False
                         return
                     except Exception as e:
