@@ -1,0 +1,8 @@
+# Dépendances pour packager BotMaster (GitHub Actions + PyInstaller local).
+flask>=3.0
+PySide6>=6.6
+pywin32
+psutil
+pyautogui
+pyperclip
+playwright>=1.40

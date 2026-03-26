@@ -2937,60 +2937,16 @@ else:
     APP_EXE_NAME = "SnowBot"  # nom de l'exe des instances
     APP_ALERT_TAG = "SNOWMASTER"
 
+# Version applicative (mise à jour manuelle avant chaque build).
+APP_VERSION = "0.6.0"
 
-# Identifiant de build : généré automatiquement en CI dans build_id.txt (PyInstaller --add-data).
-# Format typique : « run_id GitHub » + « SHA du commit » — pas d'édition manuelle.
-def _load_embedded_build_id(fallback: str = "dev-local") -> str:
-    roots = []
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            roots.append(meipass)
-        roots.append(os.path.dirname(sys.executable))
-    else:
-        roots.append(os.path.dirname(os.path.abspath(__file__)))
-    for root in roots:
-        p = os.path.join(root, "build_id.txt")
-        if os.path.isfile(p):
-            try:
-                with open(p, encoding="utf-8") as f:
-                    line = (f.readline() or "").strip()
-                if line:
-                    return line
-            except Exception:
-                pass
-    return fallback
+# URL du manifest de mise à jour (JSON) hébergé sur le repo public d'updates.
+# À adapter : par exemple
+#   https://raw.githubusercontent.com/<user>/snowmaster-updates/main/manifest.json
+UPDATE_MANIFEST_URL = "https://example.com/snowmaster/manifest.json"
 
-
-APP_BUILD_ID = _load_embedded_build_id("dev-local")
-# Compat affichage / User-Agent (même valeur que le build CI).
-APP_VERSION = APP_BUILD_ID
-
-# Mises à jour : remplir UPDATE_GITHUB_REPO (format « propriétaire/nom-du-repo ») pour utiliser automatiquement :
-#   https://github.com/<repo>/releases/latest/download/update-manifest.json
-# (généré par le workflow GitHub Actions à chaque build.)
-UPDATE_GITHUB_REPO = "IsmailZegour/SnowMaster"  # ex. "MonCompte/SnowMaster"
-
-# Si non vide : URL complète du manifest JSON (après la variable d'environnement BOTMASTER_UPDATE_MANIFEST_URL).
-UPDATE_MANIFEST_URL = ""
-
-# Nom de l'exécutable de mise à jour, attendu à côté de l'exe principal (buildé depuis BotMasterUpdater.py).
-UPDATER_EXE_NAME = "BotMasterUpdater.exe"
-
-
-def _effective_update_manifest_url() -> str:
-    env_m = (os.environ.get("BOTMASTER_UPDATE_MANIFEST_URL") or "").strip()
-    if env_m:
-        return env_m
-    if (UPDATE_MANIFEST_URL or "").strip():
-        return UPDATE_MANIFEST_URL.strip()
-    repo = (UPDATE_GITHUB_REPO or "").strip().strip("/")
-    if repo:
-        return (
-            f"https://github.com/{repo}/releases/latest/download/update-manifest.json"
-        )
-    return ""
-
+# Nom de l'exécutable de mise à jour, attendu à côté de l'exe principal.
+UPDATER_EXE_NAME = "SnowMasterUpdater.exe"
 
 # Discord / webhooks
 DISCORD_ALERT_SEARCH_TOKEN = f"ALERTE {APP_ALERT_TAG}"
@@ -11728,6 +11684,21 @@ class LoadingSplash(QWidget):
             )
 
 
+def _parse_version(version_str: str) -> tuple:
+    """Transforme '1.4.2' en tuple comparable (1,4,2)."""
+    parts = []
+    for chunk in str(version_str).split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def _is_remote_version_newer(remote: str, local: str) -> bool:
+    return _parse_version(remote) > _parse_version(local)
+
+
 def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
     """
     Vérifie le manifest distant, propose une mise à jour si une version plus
@@ -11737,43 +11708,29 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
         True  -> continuer le démarrage normal
         False -> une mise à jour a été lancée / erreur bloquante, ne pas continuer
     """
-    # En mode script Python, ne pas gêner le dev (sauf BOTMASTER_FORCE_UPDATE_CHECK=1).
-    if not getattr(sys, "frozen", False):
-        force = (os.environ.get("BOTMASTER_FORCE_UPDATE_CHECK") or "").strip().lower()
-        if force not in ("1", "true", "yes", "on"):
-            return True
-
-    manifest_url = _effective_update_manifest_url()
-    if not manifest_url:
+    if not UPDATE_MANIFEST_URL:
         return True
 
     try:
-        req = urllib.request.Request(
-            manifest_url,
-            headers={"User-Agent": f"{APP_DISPLAY_NAME}/{APP_VERSION} (update-check)"},
-        )
-        with urllib.request.urlopen(req, timeout=12.0) as resp:
-            data = resp.read().decode("utf-8-sig", errors="replace")
+        with urllib.request.urlopen(UPDATE_MANIFEST_URL, timeout=4.0) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
         manifest = json.loads(data)
-        remote_build_id = str(
-            manifest.get("build_id") or manifest.get("version") or ""
-        ).strip()
+        remote_version = str(manifest.get("version", "")).strip()
         download_url = manifest.get("download_url", "")
-        if not remote_build_id or not download_url:
+        if not remote_version or not download_url:
             return True
     except Exception:
         # En cas d'erreur réseau ou de parsing, on démarre simplement l'app.
         return True
 
-    local_build_id = (APP_BUILD_ID or "").strip()
-    if remote_build_id == local_build_id:
+    if not _is_remote_version_newer(remote_version, APP_VERSION):
         return True
 
     # Demander à l'utilisateur s'il veut mettre à jour maintenant.
     msg = (
         f"Une nouvelle version de {APP_DISPLAY_NAME} est disponible.\n\n"
-        f"Build installé : {local_build_id}\n"
-        f"Build publié : {remote_build_id}\n\n"
+        f"Version actuelle : {APP_VERSION}\n"
+        f"Nouvelle version : {remote_version}\n\n"
         "Voulez-vous télécharger et installer cette mise à jour maintenant ?"
     )
     box = QMessageBox(parent_widget)
@@ -11804,7 +11761,7 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
             "--download-url",
             download_url,
             "--version",
-            remote_build_id,
+            remote_version,
         ]
         subprocess.Popen(args, cwd=exe_dir)
     except Exception as e:
