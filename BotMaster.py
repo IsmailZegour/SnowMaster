@@ -177,12 +177,8 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect
 
 # system libs used by runner
 import psutil
-import win32gui, win32process, win32con, win32api, win32security
-import socket
+import win32gui, win32process, win32con, win32api
 
-# runner automation libs
-import pyautogui
-import pyperclip
 
 # networking helper
 import urllib.request
