@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Assistant graphique de mise à jour pour BotMaster.
-- Lancé par BotMaster : affiche les builds, bouton pour télécharger / installer, barre de progression.
-- Lancé seul : vérifie le manifest (fichier BotMaster_update.json ou arguments) et indique si l'app est à jour.
+Assistant graphique de mise à jour pour SnowMaster.
+- Lancé par SnowMaster : reçoit les URLs en argument.
+- Lancé seul : utilise les constantes ci‑dessous (comme UPDATE_GITHUB_REPO dans SnowMaster.py),
+  ou les variables d'environnement / la ligne de commande.
 
-Packaging : pyinstaller --noconfirm --onefile --windowed --name BotMasterUpdater BotMasterUpdater.py
+Packaging : pyinstaller --noconfirm --onefile --windowed --name SnowMasterUpdater SnowMasterUpdater.py
 """
 from __future__ import annotations
 
@@ -12,11 +13,120 @@ import argparse
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+
+import tkinter as tk
+from tkinter import ttk
+
+# ----- Mêmes idées que dans SnowMaster.py : remplis UPDATE_GITHUB_REPO (ou UPDATE_MANIFEST_URL). -----
+UPDATE_GITHUB_REPO = "IsmailZegour/SnowMaster"  # ex. "MonCompte/SnowMaster" — reprendre la valeur de SnowMaster.py
+UPDATE_MANIFEST_URL = ""  # optionnel : URL complète du update-manifest.json
+# --------------------------------------------------------------------------------------------------
+
+_UA_GH = "SnowMaster-UpdateCheck/1.0"
+_RE_GH_LATEST = re.compile(
+    r"^https://github\.com/([^/]+)/([^/]+)/releases/latest/download/([^/?#]+)$",
+    re.I,
+)
+
+
+def _repo_from_gh_latest_url(url: str) -> str:
+    m = _RE_GH_LATEST.match((url or "").strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def _gh_headers_api() -> dict:
+    return {
+        "User-Agent": _UA_GH,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _gh_headers_asset() -> dict:
+    return {"User-Agent": _UA_GH}
+
+
+def _gh_api_latest_release(owner: str, repo: str) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
+        headers=_gh_headers_api(),
+    )
+    with urllib.request.urlopen(req, timeout=22.0) as resp:
+        return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+
+
+def _gh_find_asset_url(release: dict, filename: str) -> str:
+    for a in release.get("assets") or []:
+        if (a.get("name") or "") == filename:
+            u = (a.get("browser_download_url") or "").strip()
+            if u:
+                return u
+    raise FileNotFoundError(f"Asset {filename!r} introuvable dans la release.")
+
+
+def _gh_http_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers=_gh_headers_asset())
+    with urllib.request.urlopen(req, timeout=22.0) as resp:
+        return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+
+
+def fetch_update_manifest_dict(
+    manifest_url: str, github_repo_fallback: str = ""
+) -> dict:
+    repo = (github_repo_fallback or "").strip().strip("/") or _repo_from_gh_latest_url(
+        manifest_url or ""
+    )
+    req = urllib.request.Request(
+        (manifest_url or "").strip(), headers={"User-Agent": _UA_GH}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=18.0) as resp:
+            return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+    except urllib.error.HTTPError as e:
+        if e.code not in (404, 403):
+            raise
+    if "/" not in repo:
+        raise RuntimeError("Manifest introuvable : vérifie UPDATE_GITHUB_REPO.")
+    o, _, r = repo.partition("/")
+    try:
+        rel = _gh_api_latest_release(o, r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                f"GitHub : aucune release « latest » sur {o}/{r} (404). "
+                "Lance le workflow « Build SnowMaster » sur GitHub."
+            ) from e
+        raise
+    return _gh_http_json(_gh_find_asset_url(rel, "update-manifest.json"))
+
+
+def resolve_latest_release_asset_url(
+    asset_url: str, github_repo_fallback: str, asset_filename: str
+) -> str:
+    repo = (github_repo_fallback or "").strip().strip("/") or _repo_from_gh_latest_url(
+        asset_url or ""
+    )
+    url = (asset_url or "").strip()
+    if not url or "github.com" not in url.lower() or "/releases/" not in url.lower():
+        return url
+    try:
+        rq = urllib.request.Request(url, method="HEAD", headers={"User-Agent": _UA_GH})
+        with urllib.request.urlopen(rq, timeout=15.0) as resp:
+            if resp.status < 400:
+                return url
+    except Exception:
+        pass
+    if "/" not in repo:
+        return url
+    o, _, r = repo.partition("/")
+    rel = _gh_api_latest_release(o, r)
+    return _gh_find_asset_url(rel, asset_filename)
 
 
 def _windows_detach_flags():
@@ -35,18 +145,7 @@ def _updater_root_dir() -> str:
 
 
 def _default_target_exe() -> str:
-    return os.path.join(_updater_root_dir(), "BotMaster.exe")
-
-
-def _load_sidecar_config() -> dict:
-    p = os.path.join(_updater_root_dir(), "BotMaster_update.json")
-    if not os.path.isfile(p):
-        return {}
-    try:
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return os.path.join(_updater_root_dir(), "SnowMaster.exe")
 
 
 def _read_local_build_id(target_exe: str) -> str:
@@ -68,22 +167,12 @@ def _manifest_url_from_repo(repo: str) -> str:
     return f"https://github.com/{r}/releases/latest/download/update-manifest.json"
 
 
-def _fetch_manifest(manifest_url: str) -> dict:
-    req = urllib.request.Request(
-        manifest_url,
-        headers={"User-Agent": "BotMasterUpdater/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=18.0) as resp:
-        data = resp.read().decode("utf-8-sig", errors="replace")
-    return json.loads(data)
-
-
 def _download_to_file(
     url: str,
     dest_path: str,
     progress_q: queue.Queue,
 ) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "BotMasterUpdater/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "SnowMasterUpdater/1.0"})
     with urllib.request.urlopen(req, timeout=900) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
         n = 0
@@ -120,7 +209,9 @@ def _replace_and_relaunch(target: str, tmp_dl: str) -> None:
             except OSError:
                 time.sleep(0.25)
         else:
-            raise RuntimeError("Impossible de remplacer l'exécutable (fichier verrouillé ?).")
+            raise RuntimeError(
+                "Impossible de remplacer l'exécutable (fichier verrouillé ?)."
+            )
 
     for _ in range(120):
         try:
@@ -158,18 +249,15 @@ class UpdaterApp:
         download_url: str,
         local_build_id: str,
         remote_build_id: str,
+        github_repo_fallback: str = "",
     ):
-        import tkinter as tk
-        from tkinter import ttk
-
-        self._tk = tk
-        self._ttk = ttk
         self.target_exe = os.path.abspath(target_exe)
-        self.app_name = app_name or "BotMaster"
+        self.app_name = app_name or "SnowMaster"
         self.manifest_url = (manifest_url or "").strip()
         self.download_url = (download_url or "").strip()
         self.local_build_id = (local_build_id or "").strip()
         self.remote_build_id = (remote_build_id or "").strip()
+        self._github_repo = (github_repo_fallback or "").strip().strip("/")
 
         self.root = tk.Tk()
         self.root.title(f"Mise à jour — {self.app_name}")
@@ -206,7 +294,9 @@ class UpdaterApp:
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill=tk.X, pady=(8, 0))
 
-        self.btn_install = ttk.Button(btn_row, text="Télécharger et installer", command=self._on_install)
+        self.btn_install = ttk.Button(
+            btn_row, text="Télécharger et installer", command=self._on_install
+        )
         self.btn_install.pack(side=tk.RIGHT, padx=(8, 0))
 
         self.btn_close = ttk.Button(btn_row, text="Fermer", command=self.root.destroy)
@@ -223,15 +313,26 @@ class UpdaterApp:
     def _resolve_manifest_url(self) -> str:
         if self.manifest_url:
             return self.manifest_url
-        cfg = _load_sidecar_config()
-        mu = (cfg.get("manifest_url") or "").strip()
-        if mu:
-            return mu
-        repo = (cfg.get("github_repo") or "").strip()
-        return _manifest_url_from_repo(repo)
+        env_m = (os.environ.get("BOTMASTER_UPDATE_MANIFEST_URL") or "").strip()
+        if env_m:
+            return env_m
+        if (UPDATE_MANIFEST_URL or "").strip():
+            return UPDATE_MANIFEST_URL.strip()
+        repo_env = (os.environ.get("BOTMASTER_GITHUB_REPO") or "").strip().strip("/")
+        if repo_env:
+            return _manifest_url_from_repo(repo_env)
+        return _manifest_url_from_repo(UPDATE_GITHUB_REPO)
 
     def _apply_state_from_args_or_fetch(self) -> None:
         if self.download_url and self.remote_build_id:
+            try:
+                self.download_url = resolve_latest_release_asset_url(
+                    self.download_url,
+                    self._github_repo,
+                    "SnowMaster.exe",
+                )
+            except Exception:
+                pass
             self._show_update_available_ui()
             return
 
@@ -239,24 +340,28 @@ class UpdaterApp:
         if not murl:
             self.lbl_title.configure(text="Configuration incomplète")
             self._set_body(
-                "Impossible de vérifier les mises à jour.\n\n"
-                "Créez un fichier BotMaster_update.json à côté de cet utilitaire, par exemple :\n"
-                '  { "github_repo": "votre-compte/votre-depot" }\n\n'
-                "Ou passez --manifest-url ou --github-repo en ligne de commande."
+                "Impossible de vérifier les mises à jour : aucune URL de manifest connue.\n\n"
+                "Renseignez UPDATE_GITHUB_REPO ou UPDATE_MANIFEST_URL en tête du fichier "
+                "SnowMasterUpdater.py (comme dans SnowMaster.py), ou utilisez les variables "
+                "d'environnement BOTMASTER_GITHUB_REPO / BOTMASTER_UPDATE_MANIFEST_URL, "
+                "ou les options --github-repo / --manifest-url en ligne de commande."
             )
             self.btn_install.state(["disabled"])
             return
 
         self.manifest_url = murl
         try:
-            man = _fetch_manifest(murl)
+            man = fetch_update_manifest_dict(murl, self._github_repo)
             remote = str(man.get("build_id") or man.get("version") or "").strip()
-            durl = str(man.get("download_url") or "").strip()
+            durl = resolve_latest_release_asset_url(
+                str(man.get("download_url") or "").strip(),
+                self._github_repo,
+                "SnowMaster.exe",
+            )
         except Exception as e:
             self.lbl_title.configure(text="Vérification impossible")
             self._set_body(
-                "Le serveur de mises à jour n'a pas pu être joint.\n\n"
-                f"Détail : {e}"
+                "Le serveur de mises à jour n'a pas pu être joint.\n\n" f"Détail : {e}"
             )
             self.btn_install.state(["disabled"])
             return
@@ -397,15 +502,29 @@ class UpdaterApp:
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Assistant de mise à jour BotMaster")
-    p.add_argument("--target-exe", default="", help="Chemin de BotMaster.exe")
-    p.add_argument("--download-url", default="", help="URL du nouvel exe (si déjà connu)")
+    p = argparse.ArgumentParser(description="Assistant de mise à jour SnowMaster")
+    p.add_argument("--target-exe", default="", help="Chemin de SnowMaster.exe")
+    p.add_argument(
+        "--download-url", default="", help="URL du nouvel exe (si déjà connu)"
+    )
     p.add_argument("--manifest-url", default="", help="URL du update-manifest.json")
-    p.add_argument("--github-repo", default="", help='Format "owner/repo" pour déduire le manifest')
+    p.add_argument(
+        "--github-repo", default="", help='Format "owner/repo" pour déduire le manifest'
+    )
     p.add_argument("--local-build-id", default="", help="Build actuellement installé")
     p.add_argument("--remote-build-id", default="", help="Build publié à installer")
-    p.add_argument("--app-display-name", default="BotMaster", help="Nom affiché")
+    p.add_argument("--app-display-name", default="SnowMaster", help="Nom affiché")
     return p.parse_args(argv)
+
+
+def _github_repo_hint(args) -> str:
+    r = (args.github_repo or "").strip().strip("/")
+    if r:
+        return r
+    r = (os.environ.get("BOTMASTER_GITHUB_REPO") or "").strip().strip("/")
+    if r:
+        return r
+    return (UPDATE_GITHUB_REPO or "").strip().strip("/")
 
 
 def main(argv=None):
@@ -414,14 +533,16 @@ def main(argv=None):
     manifest_url = (args.manifest_url or "").strip()
     if not manifest_url and (args.github_repo or "").strip():
         manifest_url = _manifest_url_from_repo(args.github_repo)
+    repo_hint = _github_repo_hint(args)
 
     app = UpdaterApp(
         target_exe=target,
-        app_name=(args.app_display_name or "BotMaster").strip(),
+        app_name=(args.app_display_name or "SnowMaster").strip(),
         manifest_url=manifest_url,
         download_url=(args.download_url or "").strip(),
         local_build_id=(args.local_build_id or "").strip(),
         remote_build_id=(args.remote_build_id or "").strip(),
+        github_repo_fallback=repo_hint,
     )
     app.root.mainloop()
 

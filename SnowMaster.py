@@ -181,6 +181,7 @@ import win32gui, win32process, win32con, win32api
 
 
 # networking helper
+import urllib.error
 import urllib.request
 
 import re
@@ -2962,16 +2963,14 @@ APP_BUILD_ID = _load_embedded_build_id("dev-local")
 # Compat affichage / User-Agent (même valeur que le build CI).
 APP_VERSION = APP_BUILD_ID
 
-# Mises à jour :remplir UPDATE_GITHUB_REPO (format « propriétaire/nom-du-repo ») pour utiliser automatiquement :
-#   https://github.com/<repo>/releases/latest/download/update-manifest.json
-# (généré par le workflow GitHub Actions à chaque build.)
+# Mises à jour : UPDATE_GITHUB_REPO = « owner/repo ».
 UPDATE_GITHUB_REPO = "IsmailZegour/SnowMaster"  # ex. "MonCompte/SnowMaster"
 
 # Si non vide : URL complète du manifest JSON (après la variable d'environnement BOTMASTER_UPDATE_MANIFEST_URL).
 UPDATE_MANIFEST_URL = ""
 
-# Nom de l'exécutable de mise à jour, attendu à côté de l'exe principal (buildé depuis BotMasterUpdater.py).
-UPDATER_EXE_NAME = "BotMasterUpdater.exe"
+# Nom de l'exécutable de mise à jour, attendu à côté de l'exe principal.
+UPDATER_EXE_NAME = "SnowMasterUpdater.exe"
 
 
 def _effective_update_manifest_url() -> str:
@@ -2989,7 +2988,7 @@ def _effective_update_manifest_url() -> str:
 
 
 def _sync_build_id_sidecar_for_updater() -> None:
-    """Écrit build_id.txt à côté de l'exe pour BotMasterUpdater (vérification en lancement autonome)."""
+    """Écrit build_id.txt à côté de l'exe pour SnowMasterUpdater (lancement autonome)."""
     if not getattr(sys, "frozen", False):
         return
     try:
@@ -2998,6 +2997,110 @@ def _sync_build_id_sidecar_for_updater() -> None:
             f.write((APP_BUILD_ID or "").strip())
     except Exception:
         pass
+
+
+# ----- GitHub releases (manifest + exe) : public ou privé (token) -----
+_UA_GH = "SnowMaster-UpdateCheck/1.0"
+_RE_GH_LATEST = re.compile(
+    r"^https://github\.com/([^/]+)/([^/]+)/releases/latest/download/([^/?#]+)$",
+    re.I,
+)
+
+
+def _repo_from_gh_latest_url(url: str) -> str:
+    m = _RE_GH_LATEST.match((url or "").strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def _gh_headers_api() -> dict:
+    return {
+        "User-Agent": _UA_GH,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _gh_headers_asset() -> dict:
+    return {"User-Agent": _UA_GH}
+
+
+def _gh_api_latest_release(owner: str, repo: str) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
+        headers=_gh_headers_api(),
+    )
+    with urllib.request.urlopen(req, timeout=22.0) as resp:
+        return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+
+
+def _gh_find_asset_url(release: dict, filename: str) -> str:
+    for a in release.get("assets") or []:
+        if (a.get("name") or "") == filename:
+            u = (a.get("browser_download_url") or "").strip()
+            if u:
+                return u
+    raise FileNotFoundError(f"Asset {filename!r} introuvable dans la release.")
+
+
+def _gh_http_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers=_gh_headers_asset())
+    with urllib.request.urlopen(req, timeout=22.0) as resp:
+        return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+
+
+def fetch_update_manifest_dict(
+    manifest_url: str, github_repo_fallback: str = ""
+) -> dict:
+    """Manifest update-manifest.json (URL directe, puis repli API GitHub si 404)."""
+    repo = (github_repo_fallback or "").strip().strip("/") or _repo_from_gh_latest_url(
+        manifest_url or ""
+    )
+    req = urllib.request.Request(
+        (manifest_url or "").strip(), headers={"User-Agent": _UA_GH}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=18.0) as resp:
+            return json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+    except urllib.error.HTTPError as e:
+        if e.code not in (404, 403):
+            raise
+    if "/" not in repo:
+        raise RuntimeError("Manifest introuvable : vérifie UPDATE_GITHUB_REPO.")
+    o, _, r = repo.partition("/")
+    try:
+        rel = _gh_api_latest_release(o, r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                f"GitHub : aucune release « latest » sur {o}/{r} (404). "
+                "Lance le workflow « Build SnowMaster » sur GitHub."
+            ) from e
+        raise
+    return _gh_http_json(_gh_find_asset_url(rel, "update-manifest.json"))
+
+
+def resolve_latest_release_asset_url(
+    asset_url: str, github_repo_fallback: str, asset_filename: str
+) -> str:
+    """URL finale pour l'asset de release (HEAD, puis repli API si besoin)."""
+    repo = (github_repo_fallback or "").strip().strip("/") or _repo_from_gh_latest_url(
+        asset_url or ""
+    )
+    url = (asset_url or "").strip()
+    if not url or "github.com" not in url.lower() or "/releases/" not in url.lower():
+        return url
+    try:
+        rq = urllib.request.Request(url, method="HEAD", headers={"User-Agent": _UA_GH})
+        with urllib.request.urlopen(rq, timeout=15.0) as resp:
+            if resp.status < 400:
+                return url
+    except Exception:
+        pass
+    if "/" not in repo:
+        return url
+    o, _, r = repo.partition("/")
+    rel = _gh_api_latest_release(o, r)
+    return _gh_find_asset_url(rel, asset_filename)
 
 
 # Discord / webhooks
@@ -11755,20 +11858,15 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
     if not manifest_url:
         return True
 
-    _sync_build_id_sidecar_for_updater()
-
     try:
-        req = urllib.request.Request(
-            manifest_url,
-            headers={"User-Agent": f"{APP_DISPLAY_NAME}/{APP_VERSION} (update-check)"},
-        )
-        with urllib.request.urlopen(req, timeout=12.0) as resp:
-            data = resp.read().decode("utf-8-sig", errors="replace")
-        manifest = json.loads(data)
+        manifest = fetch_update_manifest_dict(manifest_url, UPDATE_GITHUB_REPO)
         remote_build_id = str(
             manifest.get("build_id") or manifest.get("version") or ""
         ).strip()
-        download_url = manifest.get("download_url", "")
+        download_url = (manifest.get("download_url") or "").strip()
+        download_url = resolve_latest_release_asset_url(
+            download_url, UPDATE_GITHUB_REPO, "SnowMaster.exe"
+        )
         if not remote_build_id or not download_url:
             return True
     except Exception:
@@ -11779,7 +11877,7 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
     if remote_build_id == local_build_id:
         return True
 
-    # Popup : ouvrir l'assistant graphique (BotMasterUpdater) pour confirmer et télécharger.
+    # Popup : ouvrir l'assistant graphique (SnowMasterUpdater) pour confirmer et télécharger.
     box = QMessageBox(parent_widget)
     box.setIcon(QMessageBox.Information)
     box.setWindowTitle(f"Mise à jour — {APP_DISPLAY_NAME}")
@@ -11816,6 +11914,8 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
             download_url,
             "--manifest-url",
             manifest_url,
+            "--github-repo",
+            (UPDATE_GITHUB_REPO or "").strip().strip("/"),
             "--local-build-id",
             local_build_id,
             "--remote-build-id",
@@ -11839,6 +11939,9 @@ def maybe_check_for_update_and_run_updater(parent_widget=None) -> bool:
 # ======================== MAIN ============================
 def main():
     load_paths()
+    if getattr(sys, "frozen", False):
+        _sync_build_id_sidecar_for_updater()
+
     # start flask server in a background thread
     threading.Thread(target=run_server, daemon=True).start()
 

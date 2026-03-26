@@ -1,20 +1,20 @@
-# Compile BotMaster.exe + BotMasterUpdater.exe et publie une GitHub Release.
+# Compile SnowMaster.exe + SnowMasterUpdater.exe et publie une GitHub Release.
 # Le manifest update-manifest.json contient build_id (run_id + SHA) pour détecter les nouveaux builds.
-name: Build BotMaster
+name: Build SnowMaster
 
 on:
   workflow_dispatch:
   push:
     branches: [main, master]
     paths:
-      - "BotMaster.py"
-      - "BotMasterUpdater.py"
+      - "SnowMaster.py"
+      - "SnowMasterUpdater.py"
       - "images/master.ico"
-      - ".github/workflows/build-botmaster.yml"
+      - ".github/workflows/build-snowmaster.yml"
 
 # Évite d’empiler plusieurs builds si tu pousses plusieurs commits à la suite.
 concurrency:
-  group: build-botmaster-${{ github.workflow }}-${{ github.ref }}
+  group: build-snowmaster-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -33,7 +33,7 @@ jobs:
           python-version: "3.11"
           # Cache pip : la clé inclut le hash de CE fichier. Modifier la ligne pip ci‑dessous invalide le cache (normal).
           cache: pip
-          cache-dependency-path: .github/workflows/build-botmaster.yml
+          cache-dependency-path: .github/workflows/build-snowmaster.yml
 
       - name: Install dependencies
         run: |
@@ -47,27 +47,27 @@ jobs:
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
           [System.IO.File]::WriteAllText("$pwd/build_id.txt", $id.Trim(), $utf8NoBom)
 
-      - name: Build BotMaster.exe
+      - name: Build SnowMaster.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
           --icon "images/master.ico"
           --uac-admin
           --add-data "build_id.txt;."
-          --name BotMaster
-          "BotMaster.py"
+          --name SnowMaster
+          "SnowMaster.py"
 
-      - name: Build BotMasterUpdater.exe
+      - name: Build SnowMasterUpdater.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
-          --name BotMasterUpdater
-          "BotMasterUpdater.py"
+          --name SnowMasterUpdater
+          "SnowMasterUpdater.py"
 
       - name: Write update-manifest.json
         shell: pwsh
         run: |
           $bid = (Get-Content -Path "build_id.txt" -Raw).Trim()
           $repo = "${{ github.repository }}"
-          $downloadUrl = "https://github.com/$repo/releases/latest/download/BotMaster.exe"
+          $downloadUrl = "https://github.com/$repo/releases/latest/download/SnowMaster.exe"
           $obj = [ordered]@{ build_id = $bid; download_url = $downloadUrl }
           $json = $obj | ConvertTo-Json -Compress
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -81,10 +81,10 @@ jobs:
           body: |
             Build déclenché par le push sur `${{ github.ref_name }}`.
             - Identifiant de build : `${{ github.run_id }}-${{ github.sha }}` (voir `update-manifest.json`, champ `build_id`).
-            - Téléchargement direct : [BotMaster.exe](https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_id }}/BotMaster.exe)
+            - Téléchargement direct : [SnowMaster.exe](https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_id }}/SnowMaster.exe)
           files: |
-            dist/BotMaster.exe
-            dist/BotMasterUpdater.exe
+            dist/SnowMaster.exe
+            dist/SnowMasterUpdater.exe
             update-manifest.json
           fail_on_unmatched_files: true
           make_latest: true

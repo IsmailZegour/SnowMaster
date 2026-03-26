@@ -8,3 +8,4 @@ configs/
 
 # Généré en CI ou en local pour PyInstaller (ne pas versionner)
 build_id.txt
+
