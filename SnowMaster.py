@@ -7860,6 +7860,15 @@ class SnowMasterGUI(QWidget):
                         poll_interval=0.25,
                         log_progress=True,
                         small_title=title,
+                        require_connexion_click_before_loading=(
+                            APP_VARIANT == "ankabot"
+                        ),
+                        connexion_image=(
+                            os.path.join(RESOURCES, "connexion.png")
+                            if APP_VARIANT == "ankabot"
+                            else None
+                        ),
+                        connexion_confidence=0.3,
                     )
                     try:
                         _post_json(
@@ -8628,6 +8637,13 @@ class SnowMasterGUI(QWidget):
                     poll_interval=0.25,
                     log_progress=True,
                     small_title=title,
+                    require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
+                    connexion_image=(
+                        os.path.join(RESOURCES, "connexion.png")
+                        if APP_VARIANT == "ankabot"
+                        else None
+                    ),
+                    connexion_confidence=0.3,
                 )
                 _log_empty(
                     f"[{title}] Fenêtre détectée hwnd={main_hwnd} pid={main_pid}, register + renommage"
@@ -10419,6 +10435,7 @@ def wait_for_windows_with_early_register(
     use_virtual_screen=False,
     early_connexion_image=None,  # <— AJOUT
     early_connexion_confidence=0.3,  # <— AJOUT
+    require_connexion_click_before_loading=False,
 ):
     cmd = [exe_path] + (args or [])
     start_ts = time.time()
@@ -10440,6 +10457,8 @@ def wait_for_windows_with_early_register(
     threshold = scr_area * float(min_screen_ratio)
 
     early_registered = False
+    clicked_connexion_pids = set()
+    first_click_ts = None
     while True:
         now = time.time()
         if now - start_ts > total_timeout:
@@ -10448,13 +10467,46 @@ def wait_for_windows_with_early_register(
             )
         candidate_pids = get_recent_child_pids(p.pid, start_ts)
 
-        # === EARLY CLICK sur la 1ʳᵉ petite fenêtre (AnkaBot login) ===
-        # On le fait une seule fois par PID, et seulement si une image a été fournie.
+        # === EARLY CLICK sur la fenêtre de connexion (mode AnkaBot) ===
+        # En mode require_connexion_click_before_loading, on clique d'abord "Connexion"
+        # avant de gérer la petite fenêtre de lancement.
+        if require_connexion_click_before_loading and early_connexion_image:
+            for cpid in list(candidate_pids):
+                if cpid in clicked_connexion_pids:
+                    continue
+                for h in find_hwnds_for_pid_allow_empty_title(cpid):
+                    try:
+                        if not win32gui.IsWindowVisible(h):
+                            continue
+                        area = get_window_area(h)
+                        if area <= 0 or area >= threshold:
+                            continue
+                        ok = click_connexion_button(
+                            h,
+                            image_path=early_connexion_image,
+                            confidence=early_connexion_confidence,
+                            timeout=1.2,
+                            background=True,
+                        )
+                        if ok:
+                            clicked_connexion_pids.add(cpid)
+                            if first_click_ts is None:
+                                first_click_ts = time.time()
+                            time.sleep(0.2)
+                            break
+                    except Exception:
+                        pass
 
         # EARLY REGISTER : enregistrer la petite fenêtre de chargement (pid/hwnd) pour pouvoir
         # la terminer prématurément via "Terminer". Sera écrasé dès que la grande fenêtre
         # est détectée (second /register dans run_snowbot_flow).
         if not early_registered:
+            if require_connexion_click_before_loading:
+                clicked_any = len(clicked_connexion_pids) > 0
+                click_grace_elapsed = first_click_ts and (time.time() - first_click_ts) > 8.0
+                if not clicked_any and not click_grace_elapsed:
+                    time.sleep(poll_interval)
+                    continue
             for cpid in list(candidate_pids):
                 for h in find_hwnds_for_pid(cpid):
                     try:
@@ -10502,67 +10554,12 @@ def wait_for_windows_with_early_register(
 
         # time.sleep(1)
 
-        # === EARLY CLICK sur la 1ʳᵉ petite fenêtre (AnkaBot login) ===
-        if early_registered and early_connexion_image:
-            if "clicked_connexion_pids" not in locals():
-                clicked_connexion_pids = set()
-
-            # petit délai pour laisser la textbox + bouton se peindre
-            time.sleep(0.35)
-
-            pid_tag = None  # ex: "[PID: 72152]"
-            # on récupère le tag PID depuis l'early register
-            # (si tu as déjà 'cpid' dans la portée, on s'en sert directement)
-            # sinon on extraiera depuis candidate_pids
-            for cpid in list(candidate_pids):
-                pid_tag = f"[PID: {cpid}]"
-                if cpid in clicked_connexion_pids:
-                    continue
-                for h in find_hwnds_for_pid(cpid):
-                    if not win32gui.IsWindowVisible(h):
-                        continue
-                    title_txt = win32gui.GetWindowText(h) or ""
-                    area = get_window_area(h)
-
-                    # 1) la fenêtre doit être la "petite" (avant la grande)
-                    # 2) son titre doit contenir le PID (évite les faux positifs)
-                    if area < threshold and pid_tag in title_txt:
-                        try:
-                            # Centrer la petite fenêtre sur le premier écran avant le clic
-                            # (center_window_on_first_screen utilise SetWindowPos avec HWND_TOP qui met déjà au premier plan)
-                            center_window_on_first_screen(h)
-                            time.sleep(0.2)
-
-                            ok = click_connexion_button(
-                                h,
-                                image_path=early_connexion_image,  # ton connexion.png si présent
-                                confidence=early_connexion_confidence,  # p.ex. 0.55
-                                timeout=1.2,
-                                background=True,
-                            )
-                            if ok:
-                                # print(
-                                #     f"[EARLY CLICK] Connexion cliquée sur HWND={h} PID={cpid}"
-                                # )
-                                clicked_connexion_pids.add(cpid)
-                                time.sleep(0.3)
-                                break
-                        except Exception as e:
-                            # print(f"[WARN] early connexion click failed: {e}")
-                            pass
-                # si on a cliqué pour ce PID, on passe au suivant
-                if cpid in clicked_connexion_pids:
-                    break
-                # Main window detection
-                for cpid in list(candidate_pids):
-                    for h in find_hwnds_for_pid(cpid):
-                        area = get_window_area(h)
-                        if area >= threshold:
-                            title_txt = win32gui.GetWindowText(h)
-                            # print(
-                            #     f"[{datetime.fromtimestamp(now).isoformat()}] LARGE HWND={h} PID={cpid} Title='{title_txt}' Area={area}"
-                            # )
-                            return h, cpid
+        # Main window detection
+        for cpid in list(candidate_pids):
+            for h in find_hwnds_for_pid(cpid):
+                area = get_window_area(h)
+                if area >= threshold:
+                    return h, cpid
 
         time.sleep(poll_interval)
 
@@ -10649,6 +10646,9 @@ def wait_for_large_window_for_process(
     poll_interval=0.25,
     log_progress=True,
     small_title=None,
+    require_connexion_click_before_loading=False,
+    connexion_image=None,
+    connexion_confidence=0.3,
 ):
     """
     Attend l'apparition d'une "grande" fenêtre pour le process p (même critère que run_snowbot_flow).
@@ -10664,6 +10664,8 @@ def wait_for_large_window_for_process(
             f"wait_for_large_window pid={p.pid} scr_area={scr_area:.0f} threshold={threshold:.0f} ({min_screen_ratio*100:.0f}% écran) timeout={total_timeout}s"
         )
     poll_count = 0
+    clicked_connexion_pids = set()
+    first_click_ts = None
     while True:
         now = time.time()
         if now - start_ts > total_timeout:
@@ -10673,6 +10675,42 @@ def wait_for_large_window_for_process(
                 f"Timeout fenêtre >= {int(min_screen_ratio * 100)}% écran."
             )
         candidate_pids = get_recent_child_pids(p.pid, start_ts)
+        if require_connexion_click_before_loading and connexion_image:
+            for cpid in list(candidate_pids):
+                if cpid in clicked_connexion_pids:
+                    continue
+                for h in find_hwnds_for_pid_allow_empty_title(cpid):
+                    try:
+                        if not win32gui.IsWindowVisible(h):
+                            continue
+                        area = get_window_area(h)
+                        if area <= 0 or area >= threshold:
+                            continue
+                        ok = click_connexion_button(
+                            h,
+                            image_path=connexion_image,
+                            confidence=connexion_confidence,
+                            timeout=1.2,
+                            background=True,
+                        )
+                        if ok:
+                            clicked_connexion_pids.add(cpid)
+                            if first_click_ts is None:
+                                first_click_ts = time.time()
+                            time.sleep(0.2)
+                            break
+                    except Exception:
+                        pass
+
+        can_manage_loading_window = True
+        if require_connexion_click_before_loading:
+            clicked_any = len(clicked_connexion_pids) > 0
+            grace_elapsed = first_click_ts and (time.time() - first_click_ts) > 8.0
+            can_manage_loading_window = bool(clicked_any or grace_elapsed)
+            if not can_manage_loading_window:
+                poll_count += 1
+                time.sleep(poll_interval)
+                continue
         if log_progress and (poll_count == 0 or poll_count % 40 == 0):
             _log_empty(
                 f"poll #{poll_count} candidate_pids={candidate_pids} elapsed={now - start_ts:.1f}s"
@@ -10688,7 +10726,12 @@ def wait_for_large_window_for_process(
                 # Renommage des petites fenêtres de lancement pour les instances vides :
                 # toute fenêtre visible avec une aire positive, inférieure au seuil de
                 # la "grande" fenêtre, sera appelée "Lancement de <title>".
-                if small_title and area > 0 and area < threshold:
+                if (
+                    small_title
+                    and can_manage_loading_window
+                    and area > 0
+                    and area < threshold
+                ):
                     try:
                         _set_launch_window_title(h, small_title)
                     except Exception:
@@ -10735,8 +10778,13 @@ def run_snowbot_flow(
             total_timeout=120.0,
             min_screen_ratio=min_screen_ratio,
             use_virtual_screen=False,
-            early_connexion_image=os.path.join(image_dir, "connexion.png"),  # <— AJOUT
+            early_connexion_image=(
+                os.path.join(image_dir, "connexion.png")
+                if APP_VARIANT == "ankabot"
+                else None
+            ),
             early_connexion_confidence=0.3,
+            require_connexion_click_before_loading=(APP_VARIANT == "ankabot"),
         )
     except Exception as e:
         # print("Erreur lancement/extraction fenêtre:", e)
