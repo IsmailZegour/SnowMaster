@@ -968,9 +968,7 @@ def click_connexion_button(
             else:
                 print("[WARN] BM_CLICK sans effet, tentative WM_COMMAND(BN_CLICKED)")
                 if _send_bn_clicked_to_parent(btn):
-                    print(
-                        f"[EARLY CLICK] WM_COMMAND vers parent du bouton child={btn}"
-                    )
+                    print(f"[EARLY CLICK] WM_COMMAND vers parent du bouton child={btn}")
                     return True
     except Exception as e:
         print(f"[WARN] path bouton failed: {e}")
@@ -1096,10 +1094,7 @@ def click_ankabot_open_gestionnaire_toolbar_bg(main_hwnd: int) -> bool:
         print("[ANKA-GEST] aucun bouton WinForms candidat (hints gestionnaire/comptes)")
         return False
     try:
-        print(
-            "[ANKA-GEST] candidat hwnd=0x%08X text=%r"
-            % (btn, _safe_get_text(btn))
-        )
+        print("[ANKA-GEST] candidat hwnd=0x%08X text=%r" % (btn, _safe_get_text(btn)))
     except Exception:
         pass
     if _bm_click(btn):
@@ -1732,6 +1727,7 @@ def _client_to_screen(hwnd: int, x: int, y: int):
     _user32.ClientToScreen(int(hwnd), ctypes.byref(pt))
     return pt.x, pt.y
 
+
 ############### TEMPORAIRE ###############
 
 
@@ -1814,7 +1810,9 @@ def background_click_robust_by_relative(
                 cid = win32gui.GetDlgCtrlID(child) or 0
             except:
                 cid = 0
-            print(f"[BG] hit child=0x{child:08X} class='{cls}' text='{txt}' id={cid} cwp={fl}")
+            print(
+                f"[BG] hit child=0x{child:08X} class='{cls}' text='{txt}' id={cid} cwp={fl}"
+            )
 
             top = win32gui.GetAncestor(child, win32con.GA_ROOT) or parent_hwnd
             par = win32gui.GetParent(child) or 0
@@ -2619,6 +2617,27 @@ def restore_visible_without_foreground(hwnd):
             pass
 
 
+def force_window_on_left_screen_no_activate(hwnd):
+    """Force la fenêtre sur l'écran le plus à gauche sans activation."""
+    try:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+        restore_visible_without_foreground(hwnd)
+        monitor = get_leftmost_monitor()
+        x = int(monitor.get("left", 0))
+        y = int(monitor.get("top", 0))
+        win32gui.SetWindowPos(
+            int(hwnd),
+            win32con.HWND_NOTOPMOST,
+            x,
+            y,
+            0,
+            0,
+            win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def get_leftmost_monitor():
@@ -7540,9 +7559,7 @@ class SnowMasterGUI(QWidget):
 
         # --- Last Update ---
         self.lbl_status.setText(
-            self.fmt_last_update(
-                self._effective_last_update_ts(inst), with_label=False
-            )
+            self.fmt_last_update(self._effective_last_update_ts(inst), with_label=False)
         )
 
         # --- État de l’instance ---
@@ -10615,7 +10632,9 @@ def wait_for_windows_with_early_register(
         if not early_registered:
             if require_connexion_click_before_loading:
                 clicked_any = len(clicked_connexion_pids) > 0
-                click_grace_elapsed = first_click_ts and (time.time() - first_click_ts) > 8.0
+                click_grace_elapsed = (
+                    first_click_ts and (time.time() - first_click_ts) > 8.0
+                )
                 if not clicked_any and not click_grace_elapsed:
                     time.sleep(poll_interval)
                     continue
@@ -10685,6 +10704,12 @@ def _set_launch_window_title(hwnd, title):
         if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
             return
         win32gui.SetWindowText(hwnd, f"Lancement de {title}")
+        # Demande utilisateur: réduire la fenêtre de chargement juste après renommage.
+        try:
+            show_min_no_act = getattr(win32con, "SW_SHOWMINNOACTIVE", 7)
+            win32gui.ShowWindow(int(hwnd), show_min_no_act)
+        except Exception:
+            pass
     except Exception as e:
         # On ignore les erreurs pour ne pas casser le lancement, mais on log si possible.
         try:
@@ -10942,15 +10967,37 @@ def run_snowbot_flow(
         # print("WARN register (main):", e)
         pass
 
+    # 1er passage à gauche : dès que la fenêtre principale existe (avant le lock workflow).
+    # Évite de laisser une fenêtre "random" au milieu pendant l'attente du lock.
+    if APP_VARIANT == "ankabot":
+        try:
+            ok_left_prelock = force_window_on_left_screen_no_activate(main_hwnd)
+            print(
+                f"[LEFT] prelock hwnd=0x{int(main_hwnd):08X} ok={ok_left_prelock}"
+            )
+        except Exception:
+            pass
+
     acquired = False
     try:
         acquire_mouse_lock(owner=title, ttl=180.0)
         acquired = True
 
+        def _force_left(where: str):
+            if APP_VARIANT != "ankabot":
+                return
+            try:
+                ok_left = force_window_on_left_screen_no_activate(main_hwnd)
+                print(
+                    f"[LEFT] {where} hwnd=0x{int(main_hwnd):08X} ok={ok_left}"
+                )
+            except Exception:
+                pass
+
         # AnkaBot : ne pas appeler SetForegroundWindow (clics 100 % messages Win32).
         # SnowBot : comportement historique (fenêtre à gauche + premier plan pour fiabilité).
         if APP_VARIANT == "ankabot":
-            restore_visible_without_foreground(main_hwnd)
+            _force_left("initial")
         else:
             bring_to_front(main_hwnd)
         time.sleep(0.35)
