@@ -160,6 +160,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QFrame,
+    QComboBox,
 )
 from PySide6.QtGui import QIcon, QColor
 from PySide6.QtWidgets import QStyledItemDelegate
@@ -2898,11 +2899,17 @@ _state_lock = threading.Lock()
 # ----------------- Shared revenue data (prices & holdings) -----------------
 # Structure :
 # _revenue_data = {
-#     "servers": { "Imagiro": 8.25, "Orukam": 3.00, ... },   # prix unique €/M
-#     "holdings": { "TS": {"Imagiro": 50}, "M": {"Orukam": 100} }
+#     "servers": { "Imagiro": 8.25, ... },              # prix de réf. €/M (source primaire)
+#     "price_sources": { "LesKamas": {...}, ... },      # prix €/M par site scrapé
+#     "status_by_source": { "LesKamas": {...}, ... },  # statut stock par site
+#     "holdings": { "TS": {"Imagiro": 50}, "M": {...} }
 # }
 _revenue_data = {
-    "servers": {},  # prix unique du kama par serveur
+    "servers": {},  # prix €/M de référence (moyenne EUR des sites scrapés, pour totaux €)
+    "price_sources": {},  # {site: {serveur: {eur, usdt, dhs}}}
+    "status_by_source": {},  # {nom_site: {serveur: statut}}
+    "price_currency": "eur",  # devise affichée dans la grille (eur|usdt|dhs)
+    "price_display_mode": "unit",  # unit=prix/M, holdings=valeur des kamas
     "holdings": {"TS": {}, "M": {}},  # millions de kamas
 }
 _revenue_lock = threading.Lock()
@@ -3817,6 +3824,161 @@ def _normalize_server(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
+PRICE_CURRENCIES = ("eur", "usdt", "dhs")
+PRICE_CURRENCY_SUFFIX = {"eur": "€", "usdt": "USDT", "dhs": "DHS"}
+PRICE_CURRENCY_UI_LABELS = {
+    "eur": "Euros (€)",
+    "usdt": "Crypto (USDT)",
+    "dhs": "Dirhams (DHS)",
+}
+DEFAULT_PRICE_CURRENCY = "eur"
+PRICE_DISPLAY_UNIT = "unit"
+PRICE_DISPLAY_HOLDINGS = "holdings"
+DEFAULT_PRICE_DISPLAY_MODE = PRICE_DISPLAY_UNIT
+
+
+def _empty_price_triple() -> Dict[str, float]:
+    return {"eur": 0.0, "usdt": 0.0, "dhs": 0.0}
+
+
+def _normalize_price_entry(val) -> Dict[str, float]:
+    """Accepte un float legacy (€) ou un dict {eur, usdt, dhs}."""
+    if isinstance(val, dict):
+        return {
+            "eur": float(val.get("eur", 0) or 0),
+            "usdt": float(val.get("usdt", 0) or 0),
+            "dhs": float(val.get("dhs", 0) or 0),
+        }
+    try:
+        eur = float(val)
+    except (TypeError, ValueError):
+        eur = 0.0
+    return {"eur": eur, "usdt": 0.0, "dhs": 0.0}
+
+
+def _format_price_amount(amount: float, currency: str) -> str:
+    suffix = PRICE_CURRENCY_SUFFIX.get(currency, "€")
+    return f"{float(amount):.3f} {suffix}"
+
+
+def _price_from_cell(text: str, currency: str) -> float:
+    if not (text or "").strip():
+        return 0.0
+    low = text.lower()
+    val = _parse_number_to_float(text)
+    if val <= 0:
+        return 0.0
+    if currency == "eur":
+        if any(x in low for x in ("usdt", "usdc", "usd/m", " dhs", "dhs/", "cny")):
+            return 0.0
+        return val
+    if currency == "usdt":
+        if any(x in low for x in ("usdt", "usdc", "usd")):
+            return val
+        return 0.0
+    if currency == "dhs":
+        if "dhs" in low or "dh/" in low:
+            return val
+        if "€" not in low and "usdt" not in low and "usd" not in low and "cny" not in low:
+            return val
+    return 0.0
+
+
+def _resolve_price_columns(col_names: List[str]) -> Dict[str, int | None]:
+    """Repère les colonnes EUR (PayPal/Skrill/SEPA), USDT et Maroc (DHS)."""
+    idx: Dict[str, int | None] = {"eur": None, "usdt": None, "dhs": None}
+    for i, name in enumerate(col_names):
+        n = (name or "").lower().replace("\xa0", " ")
+        if "serveur" in n or n.strip() in ("server", "servers"):
+            continue
+        if idx["dhs"] is None and ("maroc" in n or "dhs" in n or "virement maroc" in n):
+            idx["dhs"] = i
+            continue
+        if idx["usdt"] is None and (
+            "usdt" in n or "usdc" in n or ("binance" in n and "pay" in n)
+        ):
+            idx["usdt"] = i
+            continue
+        if idx["eur"] is None:
+            if "paypal" in n and ("skrill" in n or "sepa" in n):
+                idx["eur"] = i
+                continue
+            if (
+                "paypal" in n
+                and "skrill" not in n
+                and "bitcoin" not in n
+                and "usdt" not in n
+            ):
+                idx["eur"] = i
+                continue
+    if idx["eur"] is None:
+        for i, name in enumerate(col_names):
+            n = (name or "").lower()
+            if any(
+                x in n
+                for x in ("bitcoin", "usdt", "usdc", "maroc", "alipay", "cny", "stock")
+            ):
+                continue
+            if "paypal" in n or "skrill" in n or "sepa" in n:
+                idx["eur"] = i
+                break
+    return idx
+
+
+def _extract_prices_from_row(texts: List[str], col_idx: Dict[str, int | None]) -> Dict[str, float]:
+    prices = _empty_price_triple()
+    for cur in PRICE_CURRENCIES:
+        ci = col_idx.get(cur)
+        if ci is not None and ci < len(texts):
+            prices[cur] = _price_from_cell(texts[ci], cur)
+    return prices
+
+
+def _has_any_price(prices: Dict[str, float]) -> bool:
+    return any(float(prices.get(c, 0) or 0) > 0 for c in PRICE_CURRENCIES)
+
+
+def _eur_flat_from_source_map(source_map: Dict[str, object]) -> Dict[str, float]:
+    return {
+        srv: _normalize_price_entry(val)["eur"]
+        for srv, val in (source_map or {}).items()
+    }
+
+
+def _average_eur_prices_from_sources(
+    price_sources: Dict[str, Dict[str, object]],
+) -> Dict[str, float]:
+    """
+    Moyenne des prix EUR/M par serveur sur toutes les sources scrapées
+    (uniquement les sites avec une valeur EUR > 0 pour ce serveur).
+    """
+    if not price_sources:
+        return {}
+    all_servers: set = set()
+    for site_map in price_sources.values():
+        all_servers.update((site_map or {}).keys())
+    out: Dict[str, float] = {}
+    for srv in iter_servers_in_display_order(all_servers):
+        vals = []
+        for site_map in price_sources.values():
+            eur = _normalize_price_entry((site_map or {}).get(srv, 0))["eur"]
+            if eur > 0:
+                vals.append(eur)
+        out[srv] = (sum(vals) / len(vals)) if vals else 0.0
+    return out
+
+
+def _servers_eur_for_holdings(data: dict) -> Dict[str, float]:
+    """Prix €/M par serveur utilisés pour valoriser les holdings (moyenne multi-sites)."""
+    sources = (data or {}).get("price_sources") or {}
+    if sources:
+        return _average_eur_prices_from_sources(sources)
+    raw = (data or {}).get("servers") or {}
+    return {
+        srv: _normalize_price_entry(val)["eur"] for srv, val in raw.items()
+    }
+
+
 def _scrape_leskamas_with_playwright(
     timeout=15000, headless=True, allowed_display_names=None, display_to_scrape_map=None
 ) -> dict:
@@ -3850,7 +4012,7 @@ def _scrape_leskamas_with_playwright(
             chosen = None
             for t in tables:
                 txt = (t.inner_text() or "").lower()
-                if "serveur" in txt:
+                if "serveur" in txt or "server" in txt:
                     chosen = t
                     break
             if chosen is None and tables:
@@ -3870,69 +4032,57 @@ def _scrape_leskamas_with_playwright(
                     ]
 
             idx_server = None
-            idx_skrill_sepa = None
             idx_status = None
             for i, name in enumerate(col_names):
-                if "serveur" in name:
+                n = (name or "").lower()
+                if "serveur" in n or "server" in n:
                     idx_server = i
-                if "skrill" in name or "sepa" in name:
-                    idx_skrill_sepa = i
-                if "stat" in name or "stock" in name or "status" in name:
+                if "stat" in n or "stock" in n or "status" in n:
                     idx_status = i
 
-            # lignes
+            col_idx = _resolve_price_columns(col_names)
+
             for tr in chosen.query_selector_all("tbody tr, tr"):
                 tds = tr.query_selector_all("td, th")
                 if not tds or len(tds) < 2:
                     continue
                 texts = [(td.inner_text() or "").strip() for td in tds]
 
-                # serveur
                 server_raw = (
                     texts[idx_server]
                     if (idx_server is not None and idx_server < len(texts))
                     else texts[0]
                 )
                 server_scraped = _normalize_server(server_raw)
+                if not server_scraped:
+                    continue
 
-                # ➜ filtre whitelist
+                srv_low = server_scraped.lower()
+                if srv_low.startswith("dofus ") or "saisonnier" in srv_low:
+                    continue
+
                 if allowed_scrape_names and server_scraped not in allowed_scrape_names:
                     continue
 
-                # status
+                prices = _extract_prices_from_row(texts, col_idx)
+                if not _has_any_price(prices):
+                    continue
+
                 status = (
                     texts[idx_status]
                     if (idx_status is not None and idx_status < len(texts))
                     else texts[-1]
                 )
 
-                # prix Skrill/SEPA
-                skrill_sepa_raw = ""
-                if idx_skrill_sepa is not None and idx_skrill_sepa < len(texts):
-                    skrill_sepa_raw = texts[idx_skrill_sepa]
-                else:
-                    for c in texts[1:4]:
-                        if (
-                            "€" in c
-                            or "€/m" in c.lower()
-                            or any(ch.isdigit() for ch in c)
-                        ):
-                            skrill_sepa_raw = c
-                            break
-
-                m = re.search(r"[-+]?\d+[.,]?\d*", skrill_sepa_raw.replace("\xa0", " "))
-                price_val = float(m.group(0).replace(",", ".")) if m else 0.0
-
-                # on garde la clef telle qu’affichée côté site, mais on peut aussi remapper vers le nom “display”
                 rows.append(
                     {
                         "server_scraped": server_scraped,
-                        "skrill_sepa_raw": skrill_sepa_raw,
-                        "price": price_val,
+                        "prices": prices,
+                        "price": prices["eur"],
                         "status": status,
                     }
                 )
-                servers_map[server_scraped] = price_val
+                servers_map[server_scraped] = prices
 
             browser.close()
     except Exception as e:
@@ -3941,67 +4091,380 @@ def _scrape_leskamas_with_playwright(
     return {"servers": servers_map, "rows": rows}
 
 
+def _scrape_ventekamas_with_playwright(
+    timeout=15000,
+    headless=True,
+    allowed_display_names=None,
+    display_to_scrape_map=None,
+    url="https://ventekamas.com/vendre-des-kamas/?lang=fr",
+) -> dict:
+    """
+    Scrape la grille des prix sur ventekamas.com (table Formidable / table-prices).
+
+    Même forme de retour que _scrape_leskamas_with_playwright :
+    - ``servers`` : dict serveur -> {eur, usdt, dhs}
+    - ``rows`` : server_scraped, prices, price (=eur), status
+
+    allowed_display_names / display_to_scrape_map : même sémantique que pour LesKamas.
+    """
+    servers_map = {}
+    rows = []
+
+    allowed_display_names = allowed_display_names or []
+    display_to_scrape_map = display_to_scrape_map or {}
+    allowed_scrape_names = {
+        _normalize_server(display_to_scrape_map.get(d, d))
+        for d in allowed_display_names
+    }
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=headless)
+            page = browser.new_page()
+            page.set_default_navigation_timeout(timeout)
+            page.goto(url)
+
+            page.wait_for_selector("table.table-prices, table.with_frm_style", timeout=12000)
+
+            chosen = page.query_selector("table.table-prices")
+            if chosen is None:
+                for t in page.query_selector_all("table"):
+                    txt = (t.inner_text() or "").lower()
+                    if "serveur" in txt and "skrill" in txt:
+                        chosen = t
+                        break
+            if chosen is None:
+                tables = page.query_selector_all("table")
+                chosen = tables[0] if tables else None
+            if chosen is None:
+                browser.close()
+                return {
+                    "servers": servers_map,
+                    "rows": rows,
+                    "error": "Aucune table de prix trouvée sur Ventekamas",
+                }
+
+            header_cells = chosen.query_selector_all("thead th, thead td")
+            col_names = []
+            if header_cells:
+                col_names = [h.inner_text().strip().lower() for h in header_cells]
+            else:
+                first_tr = chosen.query_selector("tr")
+                if first_tr:
+                    col_names = [
+                        h.inner_text().strip().lower()
+                        for h in first_tr.query_selector_all("td, th")
+                    ]
+
+            idx_server = None
+            idx_status = None
+            for i, name in enumerate(col_names):
+                n = (name or "").lower()
+                if "serveur" in n or "server" in n:
+                    idx_server = i
+                if "stock" in name or "stat" in name:
+                    idx_status = i
+
+            col_idx = _resolve_price_columns(col_names)
+
+            tr_list = chosen.query_selector_all("tbody tr")
+            if not tr_list:
+                tr_list = chosen.query_selector_all("tr")[1:]
+
+            for tr in tr_list:
+                tds = tr.query_selector_all("td, th")
+                if not tds or len(tds) < 2:
+                    continue
+                texts = [(td.inner_text() or "").strip() for td in tds]
+
+                server_raw = (
+                    texts[idx_server]
+                    if (idx_server is not None and idx_server < len(texts))
+                    else texts[0]
+                )
+                server_scraped = _normalize_server(server_raw)
+                if not server_scraped:
+                    continue
+
+                # Ignorer les lignes de section (ex. "Dofus Kamas", "Dofus Retro Saisonniers")
+                srv_low = server_scraped.lower()
+                if srv_low.startswith("dofus ") or "saisonnier" in srv_low:
+                    continue
+
+                if allowed_scrape_names and server_scraped not in allowed_scrape_names:
+                    continue
+
+                prices = _extract_prices_from_row(texts, col_idx)
+                if not _has_any_price(prices):
+                    continue
+
+                status = (
+                    texts[idx_status]
+                    if (idx_status is not None and idx_status < len(texts))
+                    else (texts[-1] if len(texts) > 1 else "")
+                )
+
+                rows.append(
+                    {
+                        "server_scraped": server_scraped,
+                        "prices": prices,
+                        "price": prices["eur"],
+                        "status": status,
+                    }
+                )
+                servers_map[server_scraped] = prices
+
+            browser.close()
+    except Exception as e:
+        return {"servers": servers_map, "rows": rows, "error": str(e)}
+
+    return {"servers": servers_map, "rows": rows}
+
+
+def _scraped_to_display_maps(scraped: dict) -> tuple:
+    """Remappe un résultat de scrape vers noms d'affichage + statuts."""
+    scraped_map = scraped.get("servers", {}) or {}
+    SCRAPED_TO_DISPLAY = {
+        _normalize_server(SERVER_SCRAPE_NAME.get(d, d)): d
+        for d in ALLOWED_SERVERS_DISPLAY
+    }
+    servers_map: Dict[str, Dict[str, float]] = {}
+    for scraped_name, price in scraped_map.items():
+        display = SCRAPED_TO_DISPLAY.get(
+            _normalize_server(scraped_name), scraped_name
+        )
+        servers_map[display] = _normalize_price_entry(price)
+
+    if servers_map:
+        ordered_map = {}
+        for name in iter_servers_in_display_order(servers_map.keys()):
+            ordered_map[name] = servers_map.get(name, _empty_price_triple())
+        servers_map = ordered_map
+
+    status_by_display = {}
+    for r in scraped.get("rows", []) or []:
+        scraped_name = _normalize_server(r.get("server_scraped", ""))
+        display = SCRAPED_TO_DISPLAY.get(scraped_name, scraped_name)
+        status_by_display[display] = r.get("status", "")
+
+    return servers_map, status_by_display
+
+
+# Sources de prix scrapées : (libellé colonne UI, fonction scrape).
+# Ajouter une entrée ici pour intégrer un nouveau site dynamiquement.
+PRICE_SCRAPE_SOURCES: List[Tuple[str, object]] = [
+    ("LesKamas", _scrape_leskamas_with_playwright),
+    ("VenteKamas", _scrape_ventekamas_with_playwright),
+]
+PRIMARY_PRICE_SOURCE = PRICE_SCRAPE_SOURCES[0][0]
+
+
+CLR_PRICE_WHITE = "#e5e7eb"
+CLR_PRICE_GREEN = "#10b981"
+CLR_PRICE_RED = "#ef4444"
+
+
+def _is_stock_complet(status: str) -> bool:
+    return "stock complet" in (status or "").strip().lower()
+
+
+def _price_status_color(status: str):
+    """Couleur stock : rouge si complet, blanc si disponible (plus de vert incomplet)."""
+    if _is_stock_complet(status):
+        return CLR_PRICE_RED
+    return CLR_PRICE_WHITE
+
+
+def _holdings_qty_m(holdings: dict, server: str) -> int:
+    holds = holdings or {}
+    return int(holds.get("TS", {}).get(server, 0) or 0) + int(
+        holds.get("M", {}).get(server, 0) or 0
+    )
+
+
+def _format_total_amount(amount: float, currency: str) -> str:
+    suffix = PRICE_CURRENCY_SUFFIX.get(currency, "€")
+    return f"{float(amount):.2f} {suffix}"
+
+
+def _price_source_labels_from_data(data: dict) -> List[str]:
+    sources = (data or {}).get("price_sources") or {}
+    labels = [lbl for lbl, _ in PRICE_SCRAPE_SOURCES if lbl in sources]
+    for lbl in sources.keys():
+        if lbl not in labels:
+            labels.append(lbl)
+    if not labels and (data or {}).get("servers"):
+        labels = [PRIMARY_PRICE_SOURCE]
+    return labels
+
+
+def _price_sources_for_ui(data: dict) -> Dict[str, Dict[str, Dict[str, float]]]:
+    data = data or {}
+    raw = dict(data.get("price_sources") or {})
+    if not raw and data.get("servers"):
+        raw = {
+            PRIMARY_PRICE_SOURCE: {
+                s: _normalize_price_entry(v) for s, v in (data.get("servers") or {}).items()
+            }
+        }
+    return {
+        site: {srv: _normalize_price_entry(val) for srv, val in srv_map.items()}
+        for site, srv_map in raw.items()
+    }
+
+
+def _current_price_currency(data: dict) -> str:
+    cur = (data or {}).get("price_currency") or DEFAULT_PRICE_CURRENCY
+    return cur if cur in PRICE_CURRENCIES else DEFAULT_PRICE_CURRENCY
+
+
+def _current_price_display_mode(data: dict) -> str:
+    mode = (data or {}).get("price_display_mode") or DEFAULT_PRICE_DISPLAY_MODE
+    if mode in (PRICE_DISPLAY_UNIT, PRICE_DISPLAY_HOLDINGS):
+        return mode
+    return DEFAULT_PRICE_DISPLAY_MODE
+
+
+class _CurrencyComboPopupFilter(QObject):
+    """Ouvre la liste au clic sur toute la surface du combo (y compris le QLineEdit)."""
+
+    def __init__(self, combo: QComboBox):
+        super().__init__(combo)
+        self._combo = combo
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.LeftButton
+        ):
+            self._combo.setFocus(Qt.MouseFocusReason)
+            QTimer.singleShot(0, self._combo.showPopup)
+            return True
+        return False
+
+
+def _configure_currency_combo(combo: QComboBox):
+    """Combo devise compact, champ uniforme, texte centré."""
+    combo.setObjectName("CurrencyCombo")
+    combo.setEditable(True)
+    combo.setFixedHeight(26)
+    combo.setFixedWidth(142)
+    combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    combo.setCursor(Qt.PointingHandCursor)
+    le = combo.lineEdit()
+    if le:
+        le.setReadOnly(True)
+        le.setAlignment(Qt.AlignCenter)
+        le.setFrame(False)
+        le.setCursor(Qt.PointingHandCursor)
+        le.setFocusPolicy(Qt.NoFocus)
+    popup_filter = _CurrencyComboPopupFilter(combo)
+    combo._popup_click_filter = popup_filter
+    combo.installEventFilter(popup_filter)
+    if le:
+        le.installEventFilter(popup_filter)
+    combo.setStyleSheet(
+        """
+        QComboBox#CurrencyCombo {
+            background-color: #1f2937;
+            color: #e5e7eb;
+            border: 1px solid rgba(148,163,184,0.32);
+            border-radius: 8px;
+            padding: 0 10px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QComboBox#CurrencyCombo:hover {
+            border-color: rgba(147,197,253,0.5);
+            background-color: #243044;
+        }
+        QComboBox#CurrencyCombo:focus {
+            border-color: rgba(96,165,250,0.75);
+        }
+        QComboBox#CurrencyCombo::drop-down {
+            width: 0px;
+            border: none;
+            background: transparent;
+        }
+        QComboBox#CurrencyCombo::down-arrow {
+            image: none;
+            width: 0px;
+            height: 0px;
+        }
+        QComboBox#CurrencyCombo QLineEdit {
+            background: transparent;
+            color: #e5e7eb;
+            border: none;
+            padding: 0;
+            selection-background-color: #2563eb;
+        }
+        QComboBox#CurrencyCombo QAbstractItemView {
+            background-color: #1f2937;
+            color: #e5e7eb;
+            border: 1px solid rgba(148,163,184,0.35);
+            border-radius: 8px;
+            padding: 4px;
+            outline: 0;
+            selection-background-color: #2563eb;
+        }
+        """
+    )
+
+
 def fetch_reference_prices_async(on_done=None):
-    """Scrape en thread, met à jour _revenue_data['servers'] et notifie l'UI."""
+    """Scrape toutes les sources, met à jour _revenue_data et notifie l'UI."""
 
     def _job():
         success = False
         count = 0
         err = ""
         try:
-            scraped = _scrape_leskamas_with_playwright(
+            scrape_kwargs = dict(
                 timeout=15000,
                 headless=True,
                 allowed_display_names=ALLOWED_SERVERS_DISPLAY,
                 display_to_scrape_map=SERVER_SCRAPE_NAME,
             )
 
-            # --- remap des noms scrapés -> noms d'affichage ---
-            scraped_map = scraped.get("servers", {}) or {}
-            # reverse: "HellMina" -> "Hell Mina", "Ombre(Shadow)" -> "Ombre", ...
-            SCRAPED_TO_DISPLAY = {
-                _normalize_server(SERVER_SCRAPE_NAME.get(d, d)): d
-                for d in ALLOWED_SERVERS_DISPLAY
-            }
-            servers_map = {}
-            for scraped_name, price in scraped_map.items():
-                display = SCRAPED_TO_DISPLAY.get(
-                    _normalize_server(scraped_name), scraped_name
-                )
-                servers_map[display] = float(price)
+            price_sources: Dict[str, Dict[str, Dict[str, float]]] = {}
+            status_by_source: Dict[str, Dict[str, str]] = {}
+            errors: List[str] = []
 
-            if servers_map:
-                ordered_map = {}
-                for name in iter_servers_in_display_order(servers_map.keys()):
-                    ordered_map[name] = servers_map.get(name, 0.0)
-                servers_map = ordered_map
+            for label, scrape_fn in PRICE_SCRAPE_SOURCES:
+                scraped = scrape_fn(**scrape_kwargs)
+                servers_map, status_map = _scraped_to_display_maps(scraped)
+                if servers_map:
+                    price_sources[label] = servers_map
+                    status_by_source[label] = status_map
+                elif scraped.get("error"):
+                    errors.append(f"{label}: {scraped.get('error')}")
 
-            if ("error" in scraped) and not servers_map:
-                raise Exception(
-                    "Playwright scraping error: " + str(scraped.get("error"))
-                )
+            reference_servers = _average_eur_prices_from_sources(price_sources)
 
-            # stocker les statuts si on en a
-            rows = scraped.get("rows", []) or []
-            status_by_display = {}
-            for r in rows:
-                scraped_name = _normalize_server(r.get("server_scraped", ""))
-                display = SCRAPED_TO_DISPLAY.get(scraped_name, scraped_name)
-                status_by_display[display] = r.get("status", "")
+            if not price_sources:
+                detail = "; ".join(errors) if errors else "aucune source"
+                raise Exception("Playwright scraping error: " + detail)
 
             with _revenue_lock:
-                _revenue_data["servers"] = servers_map
+                _revenue_data["price_sources"] = price_sources
+                _revenue_data["status_by_source"] = status_by_source
+                _revenue_data["servers"] = reference_servers
+                _revenue_data.setdefault("price_currency", DEFAULT_PRICE_CURRENCY)
+                _revenue_data.setdefault("price_display_mode", DEFAULT_PRICE_DISPLAY_MODE)
                 _revenue_data.setdefault("status", {})
-                _revenue_data["status"] = status_by_display
+                _revenue_data["status"] = status_by_source.get(
+                    PRIMARY_PRICE_SOURCE, {}
+                )
                 _revenue_data.setdefault("holdings", {"TS": {}, "M": {}})
                 for kind in ("TS", "M"):
-                    for s in servers_map.keys():
+                    for s in (reference_servers or {}).keys():
                         _revenue_data["holdings"][kind].setdefault(s, 0)
-                # >>> AJOUT : timestamp du dernier scraping
                 _revenue_data["last_scrape_ts"] = time.time()
 
-            count = len(servers_map)
+            count = len(reference_servers or {})
             success = count > 0
+            if errors:
+                err = "; ".join(errors)
 
             # notifier UI pour recalculer les euros
             try:
@@ -4116,6 +4579,24 @@ def apply_dark_blue_style(app: QApplication):
             background-color:#0b1936;
             border:1px solid rgba(148,163,184,0.28); 
             border-radius:12px; 
+        }
+        QWidget#RefPriceHeader {
+            background-color:#1f2937;
+            border:1px solid rgba(148,163,184,0.22);
+            border-radius:8px;
+        }
+        QWidget#RefPriceFooter {
+            background-color:#1a2744;
+            border:1px solid rgba(148,163,184,0.35);
+            border-radius:8px;
+        }
+        QWidget#ReferencePriceGrid, QWidget#ReferencePriceBody {
+            background: transparent;
+            border: none;
+        }
+        QWidget#ReferencePriceGrid QLabel {
+            background: transparent;
+            border: none;
         }
 
         /* Carte bleue cliquable (look proche d'un QPushButton bleu) */
@@ -4348,6 +4829,328 @@ class ClickablePanel(QLabel):
         except Exception:
             pass
         return super().mousePressEvent(e)
+
+
+REF_PRICE_COL_W = 92
+REF_PRICE_ROW_H = 28
+REF_PRICE_HDR_H = 32
+REF_PRICE_ROW_GAP = 2
+_REF_PRICE_LABEL_BASE = "background:transparent; border:none; padding:0; margin:0;"
+
+
+def _ref_price_label_style(*, header: bool = False, color: str | None = None, bold: int = 700) -> str:
+    parts = [_REF_PRICE_LABEL_BASE, f"font-weight:{bold};"]
+    if header:
+        parts.append("color:#93c5fd;")
+    elif color:
+        parts.append(f"color:{color};")
+    return " ".join(parts)
+
+
+def _configure_ref_price_label(lbl: QLabel, *, header: bool = False, color: str | None = None, bold: int = 700):
+    lbl.setAutoFillBackground(False)
+    lbl.setStyleSheet(_ref_price_label_style(header=header, color=color, bold=bold))
+
+
+class ReferencePriceRow(QWidget):
+    """Une ligne du tableau prix (en-tête, serveur ou total) avec colonnes alignées."""
+
+    def __init__(
+        self,
+        server: str,
+        source_labels: List[str],
+        is_header: bool = False,
+        is_footer: bool = False,
+    ):
+        super().__init__()
+        self.is_header = is_header
+        self.is_footer = is_footer
+        self.server_name = server
+        self.source_labels = list(source_labels)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        if is_header:
+            self.setObjectName("RefPriceHeader")
+            self.setFixedHeight(REF_PRICE_HDR_H)
+        elif is_footer:
+            self.setObjectName("RefPriceFooter")
+            self.setFixedHeight(REF_PRICE_HDR_H)
+        else:
+            self.setObjectName("StaticCard")
+            self.setFixedHeight(REF_PRICE_ROW_H)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
+
+        if is_header:
+            srv_title = "Serveur"
+        elif is_footer:
+            srv_title = "Total"
+        else:
+            srv_title = server
+        self.lbl_server = QLabel(srv_title)
+        self.lbl_server.setMinimumWidth(96)
+        _configure_ref_price_label(
+            self.lbl_server,
+            header=is_header or is_footer,
+            bold=700 if (is_header or is_footer) else 600,
+        )
+        lay.addWidget(self.lbl_server, 1)
+
+        self.price_labels: Dict[str, QLabel] = {}
+        for label in source_labels:
+            cell = QLabel(label if is_header else "0.000 €")
+            cell.setFixedWidth(REF_PRICE_COL_W)
+            cell.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            _configure_ref_price_label(cell, header=is_header)
+            lay.addWidget(cell, 0)
+            self.price_labels[label] = cell
+
+    def set_prices(
+        self, prices_by_source: Dict[str, object], currency: str = DEFAULT_PRICE_CURRENCY
+    ):
+        for label, lbl in self.price_labels.items():
+            entry = _normalize_price_entry(prices_by_source.get(label, 0.0))
+            lbl.setText(_format_price_amount(entry.get(currency, 0.0), currency))
+
+    def set_footer_amounts(
+        self, amounts_by_source: Dict[str, float], currency: str = DEFAULT_PRICE_CURRENCY
+    ):
+        for label, lbl in self.price_labels.items():
+            lbl.setText(
+                _format_total_amount(float(amounts_by_source.get(label, 0.0)), currency)
+            )
+
+    def set_cell_amounts(
+        self,
+        amounts_by_source: Dict[str, float],
+        currency: str = DEFAULT_PRICE_CURRENCY,
+        *,
+        per_unit: bool = True,
+    ):
+        for label, lbl in self.price_labels.items():
+            amt = float(amounts_by_source.get(label, 0.0))
+            if per_unit:
+                lbl.setText(_format_price_amount(amt, currency))
+            else:
+                lbl.setText(_format_total_amount(amt, currency))
+
+    def set_price_color(self, source_label: str, color_hex: str | None):
+        lbl = self.price_labels.get(source_label)
+        if not lbl:
+            return
+        _configure_ref_price_label(
+            lbl, header=False, color=color_hex or CLR_PRICE_WHITE, bold=700
+        )
+
+    def set_all_price_colors(self, colors_by_source: Dict[str, str]):
+        for label, color in colors_by_source.items():
+            self.set_price_color(label, color)
+
+
+class ReferencePriceGrid(QWidget):
+    """Grille serveur × sources : en-tête et lignes partagent le même gabarit de colonnes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ReferencePriceGrid")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._source_labels: List[str] = []
+        self._currency = DEFAULT_PRICE_CURRENCY
+        self._display_mode = DEFAULT_PRICE_DISPLAY_MODE
+        self._server_order: List[str] = []
+        self._sources: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._holdings: Dict[str, Dict[str, int]] = {"TS": {}, "M": {}}
+        self._status_by_source: Dict[str, Dict[str, str]] = {}
+        self._rows: Dict[str, ReferencePriceRow] = {}
+        self._footer: Optional[ReferencePriceRow] = None
+
+        self._root_lay = QVBoxLayout(self)
+        self._root_lay.setContentsMargins(0, 0, 0, 0)
+        self._root_lay.setSpacing(REF_PRICE_ROW_GAP)
+
+        self._header = ReferencePriceRow("", [], is_header=True)
+        self._root_lay.addWidget(self._header, 0)
+
+        self._body = QWidget()
+        self._body.setObjectName("ReferencePriceBody")
+        self._body.setAttribute(Qt.WA_StyledBackground, True)
+        self._body.setAutoFillBackground(False)
+        self._body_lay = QVBoxLayout(self._body)
+        self._body_lay.setContentsMargins(0, 0, 0, 0)
+        self._body_lay.setSpacing(REF_PRICE_ROW_GAP)
+        self._root_lay.addWidget(self._body, 0)
+
+    def source_labels(self) -> List[str]:
+        return list(self._source_labels)
+
+    def _grid_height(self, row_count: int) -> int:
+        footer_h = REF_PRICE_HDR_H + REF_PRICE_ROW_GAP if row_count >= 0 else 0
+        return (
+            REF_PRICE_HDR_H
+            + max(0, row_count) * REF_PRICE_ROW_H
+            + max(0, row_count) * REF_PRICE_ROW_GAP
+            + footer_h
+            + 4
+        )
+
+    def _site_holdings_total(
+        self, source_label: str, *, only_available: bool = True
+    ) -> float:
+        total = 0.0
+        site_map = self._sources.get(source_label) or {}
+        status_map = self._status_by_source.get(source_label) or {}
+        for srv in self._server_order:
+            if only_available and _is_stock_complet(status_map.get(srv, "")):
+                continue
+            qty = _holdings_qty_m(self._holdings, srv)
+            if qty <= 0:
+                continue
+            entry = _normalize_price_entry((site_map or {}).get(srv, 0))
+            price = float(entry.get(self._currency, 0) or 0)
+            total += qty * price
+        return total
+
+    def _cell_display_amount(self, server: str, source_label: str) -> float:
+        entry = (self._sources.get(source_label) or {}).get(
+            server, _empty_price_triple()
+        )
+        unit = float(_normalize_price_entry(entry).get(self._currency, 0) or 0)
+        if self._display_mode == PRICE_DISPLAY_HOLDINGS:
+            return _holdings_qty_m(self._holdings, server) * unit
+        return unit
+
+    def _refresh_row_texts(self):
+        per_unit = self._display_mode == PRICE_DISPLAY_UNIT
+        for srv, row in self._rows.items():
+            amounts = {
+                lbl: self._cell_display_amount(srv, lbl) for lbl in self._source_labels
+            }
+            row.set_cell_amounts(amounts, self._currency, per_unit=per_unit)
+
+    def _refresh_display_styles(self):
+        """Couleurs : rouge=stock complet, vert=meilleur prix/total, blanc=reste."""
+        for srv, row in self._rows.items():
+            available_prices: Dict[str, float] = {}
+            for lbl in self._source_labels:
+                st = (self._status_by_source.get(lbl, {}) or {}).get(srv, "")
+                if _is_stock_complet(st):
+                    continue
+                val = self._cell_display_amount(srv, lbl)
+                if val > 0:
+                    available_prices[lbl] = val
+            best_price = max(available_prices.values()) if available_prices else 0.0
+
+            colors: Dict[str, str] = {}
+            for lbl in self._source_labels:
+                st = (self._status_by_source.get(lbl, {}) or {}).get(srv, "")
+                if _is_stock_complet(st):
+                    colors[lbl] = CLR_PRICE_RED
+                elif (
+                    available_prices.get(lbl, 0) > 0
+                    and best_price > 0
+                    and available_prices.get(lbl, 0) >= best_price
+                ):
+                    colors[lbl] = CLR_PRICE_GREEN
+                else:
+                    colors[lbl] = CLR_PRICE_WHITE
+            row.set_all_price_colors(colors)
+
+        if self._footer:
+            totals = {
+                lbl: self._site_holdings_total(lbl, only_available=True)
+                for lbl in self._source_labels
+            }
+            positive = [v for v in totals.values() if v > 0]
+            best_total = max(positive) if positive else 0.0
+            footer_colors = {
+                lbl: (
+                    CLR_PRICE_GREEN
+                    if totals.get(lbl, 0) > 0 and totals.get(lbl, 0) >= best_total
+                    else CLR_PRICE_WHITE
+                )
+                for lbl in self._source_labels
+            }
+            self._footer.set_footer_amounts(totals, self._currency)
+            self._footer.set_all_price_colors(footer_colors)
+
+    def _refresh_all_display(self):
+        self._refresh_row_texts()
+        self._refresh_display_styles()
+
+    def rebuild(
+        self,
+        server_order: List[str],
+        source_labels: List[str],
+        sources: Dict[str, Dict[str, Dict[str, float]]],
+        currency: str = DEFAULT_PRICE_CURRENCY,
+        holdings: Optional[Dict[str, Dict[str, int]]] = None,
+        status_by_source: Optional[Dict[str, Dict[str, str]]] = None,
+        display_mode: str = DEFAULT_PRICE_DISPLAY_MODE,
+    ):
+        self._source_labels = list(source_labels)
+        self._currency = currency if currency in PRICE_CURRENCIES else DEFAULT_PRICE_CURRENCY
+        self._display_mode = (
+            display_mode
+            if display_mode in (PRICE_DISPLAY_UNIT, PRICE_DISPLAY_HOLDINGS)
+            else DEFAULT_PRICE_DISPLAY_MODE
+        )
+        self._server_order = list(server_order)
+        self._sources = sources
+        self._holdings = holdings or {"TS": {}, "M": {}}
+        self._status_by_source = status_by_source or {}
+        self._rows.clear()
+
+        while self._body_lay.count():
+            item = self._body_lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        if self._footer:
+            self._root_lay.removeWidget(self._footer)
+            self._footer.deleteLater()
+            self._footer = None
+
+        self._root_lay.removeWidget(self._header)
+        self._header.deleteLater()
+        self._header = ReferencePriceRow("", source_labels, is_header=True)
+        self._root_lay.insertWidget(0, self._header, 0)
+
+        for srv in server_order:
+            row = ReferencePriceRow(srv, source_labels, is_header=False)
+            self._body_lay.addWidget(row, 0)
+            self._rows[srv] = row
+
+        self._footer = ReferencePriceRow("Total", source_labels, is_footer=True)
+        self._root_lay.addWidget(self._footer, 0)
+
+        self._refresh_all_display()
+        self.setFixedHeight(self._grid_height(len(server_order)))
+
+    def update_prices(
+        self,
+        sources: Dict[str, Dict[str, Dict[str, float]]],
+        currency: str | None = None,
+        holdings: Optional[Dict[str, Dict[str, int]]] = None,
+        status_by_source: Optional[Dict[str, Dict[str, str]]] = None,
+        display_mode: str | None = None,
+    ):
+        if currency:
+            self._currency = currency if currency in PRICE_CURRENCIES else self._currency
+        if display_mode:
+            self._display_mode = (
+                display_mode
+                if display_mode in (PRICE_DISPLAY_UNIT, PRICE_DISPLAY_HOLDINGS)
+                else self._display_mode
+            )
+        if holdings is not None:
+            self._holdings = holdings
+        if status_by_source is not None:
+            self._status_by_source = status_by_source
+        self._sources = sources
+        self._refresh_all_display()
 
 
 class StaticPriceRow(QWidget):
@@ -4927,33 +5730,77 @@ class RevenueDialog(QDialog):
     def __init__(self, parent, revenue_data: dict):
         super().__init__(parent)
         self.setWindowTitle("€ générés - Détails")
-        self.setMinimumSize(520, 400)
+        self.setMinimumSize(780, 420)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # --------- GAUCHE : Panel "Prix de référence" avec une belle liste -----------
-        # --------- GAUCHE : Panel "Prix de référence" avec liste + bouton Refresh -----------
+        # --------- GAUCHE : grille multi-sources + Refresh -----------
         left_group = QGroupBox("Prix de référence")
         left_v = QVBoxLayout(left_group)
         left_v.setContentsMargins(8, 8, 8, 8)
         left_v.setSpacing(8)
 
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # pas de scrollbar
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # self.list.setSpacing(2)                                      # espacement entre lignes
-        self.list.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed
-        )  # ne s’étire pas en hauteur
+        ctrl_label_style = "color:#9aa4b2; font-size:12px;"
 
-        self.list.setFrameShape(QListWidget.NoFrame)
-        self.list.setFocusPolicy(Qt.NoFocus)
-        self.list.setItemDelegate(NoFocusDelegate(self.list))
+        devise_row = QHBoxLayout()
+        devise_row.setSpacing(8)
+        lbl_devise = QLabel("Devise")
+        lbl_devise.setFixedWidth(72)
+        lbl_devise.setStyleSheet(ctrl_label_style)
+        devise_row.addWidget(lbl_devise, 0)
+        self.cmb_currency = QComboBox()
+        for key in PRICE_CURRENCIES:
+            self.cmb_currency.addItem(PRICE_CURRENCY_UI_LABELS[key], key)
+        _configure_currency_combo(self.cmb_currency)
+        try:
+            with _revenue_lock:
+                saved_cur = _revenue_data.get("price_currency", DEFAULT_PRICE_CURRENCY)
+        except Exception:
+            saved_cur = DEFAULT_PRICE_CURRENCY
+        cur_idx = (
+            PRICE_CURRENCIES.index(saved_cur)
+            if saved_cur in PRICE_CURRENCIES
+            else 0
+        )
+        self.cmb_currency.blockSignals(True)
+        self.cmb_currency.setCurrentIndex(cur_idx)
+        self.cmb_currency.blockSignals(False)
+        self.cmb_currency.currentIndexChanged.connect(self._on_currency_changed)
+        devise_row.addWidget(self.cmb_currency, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        devise_row.addStretch(1)
+        left_v.addLayout(devise_row, 0)
 
-        left_v.addWidget(self.list, 0)  # 0 = n'étire pas, on contrôle la hauteur
+        display_row = QHBoxLayout()
+        display_row.setSpacing(8)
+        lbl_display = QLabel("Affichage")
+        lbl_display.setFixedWidth(72)
+        lbl_display.setStyleSheet(ctrl_label_style)
+        display_row.addWidget(lbl_display, 0)
+        self.chk_holdings_value = QCheckBox("Unitaire / Total")
+        self.chk_holdings_value.setCursor(Qt.PointingHandCursor)
+        self.chk_holdings_value.setToolTip(
+            "Coché : valeur totale de vos kamas (TS + Métier) pour chaque site.\n"
+            "Décoché : prix par million affiché pour chaque site."
+        )
+        try:
+            with _revenue_lock:
+                saved_mode = _revenue_data.get(
+                    "price_display_mode", DEFAULT_PRICE_DISPLAY_MODE
+                )
+        except Exception:
+            saved_mode = DEFAULT_PRICE_DISPLAY_MODE
+        self.chk_holdings_value.blockSignals(True)
+        self.chk_holdings_value.setChecked(saved_mode == PRICE_DISPLAY_HOLDINGS)
+        self.chk_holdings_value.blockSignals(False)
+        self.chk_holdings_value.toggled.connect(self._on_display_mode_toggled)
+        display_row.addWidget(self.chk_holdings_value, 1)
+        left_v.addLayout(display_row, 0)
+
+        self.price_grid = ReferencePriceGrid()
+        self.price_grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        left_v.addWidget(self.price_grid, 0)
         # --- Bouton Refresh ---
         self.btn_refresh_prices = QPushButton("Refresh")
         self.btn_refresh_prices.setCursor(Qt.PointingHandCursor)
@@ -4979,7 +5826,7 @@ class RevenueDialog(QDialog):
             when0 = "-"
         self._set_fetch_status(f"Last update : {when0}", "neutral")
 
-        root.addWidget(left_group, 1)
+        root.addWidget(left_group, 2)
 
         # --------- DROITE : Panel "Revenus" avec deux widgets bleus cliquables -------
         right_group = QGroupBox("Revenus")
@@ -5001,6 +5848,11 @@ class RevenueDialog(QDialog):
 
         # ----- Données & remplissage -----
         self.data = revenue_data or {}
+        self.data.setdefault("price_currency", _current_price_currency(self.data))
+        self.data.setdefault(
+            "price_display_mode", _current_price_display_mode(self.data)
+        )
+        self.data["servers"] = _servers_eur_for_holdings(self.data)
         servers = self.data.get("servers") or {}
         server_order = list(iter_servers_in_display_order(servers.keys()))
         if not server_order:
@@ -5016,24 +5868,10 @@ class RevenueDialog(QDialog):
             for srv in servers_all:
                 holds[kind].setdefault(srv, 0)
 
-        # Liste serveurs -> cartes statiques, taille calculée pour tout voir sans scroll
-        self._rows = []
-        ITEM_H = 28  # ta valeur actuelle
-        for name in server_order:
-            price = float(
-                (servers or {}).get(name, 0.0)
-            )  # <--- ICI: servers[name] est un float
-            it = QListWidgetItem()
-            it.setSizeHint(QSize(10, ITEM_H))
-            row = StaticPriceRow(name, price)  # affiche "19.50 €" etc.
-            self.list.addItem(it)
-            self.list.setItemWidget(it, row)
-            self._rows.append((it, row))
+        self._server_order = server_order
+        self._populate_price_grid()
 
-        # Ajuste la hauteur de la liste pour afficher les 13 items sans scroll
-        self._fit_list_height(item_height=ITEM_H, count=len(server_order))
-
-        self._apply_status_colors()
+        self._apply_price_grid_styles()
 
         # Totaux
         self._recompute_totals()
@@ -5049,24 +5887,28 @@ class RevenueDialog(QDialog):
             pass
         return super().closeEvent(e)
 
-    def _apply_status_colors(self):
+    def _status_by_source_snapshot(self) -> Dict[str, Dict[str, str]]:
         try:
             with _revenue_lock:
-                status_map = _revenue_data.get("status", {}) or {}
-            for i in range(self.list.count()):
-                it = self.list.item(i)
-                row = self.list.itemWidget(it)
-                if not row:
-                    continue
-                name = row.lbl_server.text()
-                st = (status_map.get(name, "") or "").strip().lower()
-                # Incomplet -> vert ; Stock complet -> rouge ; sinon neutre
-                if "stock complet" in st:
-                    row.setAmountColor("#ef4444")  # rouge
-                elif "incomplet" in st:
-                    row.setAmountColor("#10b981")  # vert
-                else:
-                    row.setAmountColor(None)  # style par défaut
+                status_by_source = dict(_revenue_data.get("status_by_source") or {})
+                if not status_by_source:
+                    legacy = _revenue_data.get("status", {}) or {}
+                    if legacy:
+                        status_by_source = {PRIMARY_PRICE_SOURCE: legacy}
+                return status_by_source
+        except Exception:
+            return {}
+
+    def _apply_price_grid_styles(self):
+        try:
+            sources = _price_sources_for_ui(self.data)
+            self.price_grid.update_prices(
+                sources,
+                currency=_current_price_currency(self.data),
+                holdings=self.data.get("holdings") or {"TS": {}, "M": {}},
+                status_by_source=self._status_by_source_snapshot(),
+                display_mode=_current_price_display_mode(self.data),
+            )
         except Exception:
             pass
 
@@ -5074,7 +5916,7 @@ class RevenueDialog(QDialog):
         """Recalcule les totaux TS/Métier dans ce dialog quand holdings/prix changent."""
         try:
             data = self.data  # alias local
-            servers = data.get("servers") or {}
+            servers = _servers_eur_for_holdings(data)
             holds = data.get("holdings") or {"TS": {}, "M": {}}
 
             total_ts = 0.0
@@ -5084,18 +5926,8 @@ class RevenueDialog(QDialog):
                 total_ts += int(holds.get("TS", {}).get(srv, 0)) * p
                 total_metier += int(holds.get("M", {}).get(srv, 0)) * p
 
-            self._apply_status_colors()
-
             try:
-                servers = self.data.get("servers") or {}
-                for i in range(self.list.count()):
-                    it = self.list.item(i)
-                    row = self.list.itemWidget(it)
-                    if not row:
-                        continue
-                    name = row.lbl_server.text()
-                    price = float(servers.get(name, 0.0))
-                    row.setAmount(price)
+                self._refresh_price_grid_from_store()
             except Exception:
                 pass
 
@@ -5113,16 +5945,75 @@ class RevenueDialog(QDialog):
     #         pass
     #     super().closeEvent(e)
 
-    def _fit_list_height(self, item_height: int, count: int):
-        """Calcule la hauteur exacte pour afficher 'count' items sans scroll."""
+    def _current_currency(self) -> str:
         try:
-            spacing = self.list.spacing() if hasattr(self.list, "spacing") else 6
-            total = (
-                count * item_height + max(0, count - 1) * spacing + 4
-            )  # +4 marge douce
-            self.list.setFixedHeight(total)
+            key = self.cmb_currency.currentData()
+        except Exception:
+            key = None
+        return key if key in PRICE_CURRENCIES else _current_price_currency(self.data)
+
+    def _on_currency_changed(self, _index: int = 0):
+        cur = self._current_currency()
+        self.data["price_currency"] = cur
+        try:
+            with _revenue_lock:
+                _revenue_data["price_currency"] = cur
         except Exception:
             pass
+        self._apply_price_grid_styles()
+
+    def _on_display_mode_toggled(self, checked: bool):
+        mode = PRICE_DISPLAY_HOLDINGS if checked else PRICE_DISPLAY_UNIT
+        self.data["price_display_mode"] = mode
+        try:
+            with _revenue_lock:
+                _revenue_data["price_display_mode"] = mode
+        except Exception:
+            pass
+        self._apply_price_grid_styles()
+
+    def _populate_price_grid(self):
+        """Construit la grille serveur × sources de prix."""
+        sources = _price_sources_for_ui(self.data)
+        source_labels = _price_source_labels_from_data(self.data)
+        if not source_labels:
+            source_labels = list(sources.keys())
+        self.price_grid.rebuild(
+            self._server_order,
+            source_labels,
+            sources,
+            currency=_current_price_currency(self.data),
+            holdings=self.data.get("holdings") or {"TS": {}, "M": {}},
+            status_by_source=self._status_by_source_snapshot(),
+            display_mode=_current_price_display_mode(self.data),
+        )
+
+    def _refresh_price_grid_from_store(self):
+        """Met à jour les prix depuis le store global."""
+        try:
+            with _revenue_lock:
+                snap = {
+                    "price_sources": dict(_revenue_data.get("price_sources") or {}),
+                    "servers": dict(_revenue_data.get("servers") or {}),
+                }
+        except Exception:
+            snap = {"price_sources": {}, "servers": {}}
+
+        self.data["price_sources"] = snap["price_sources"]
+        self.data["servers"] = _servers_eur_for_holdings(self.data)
+
+        sources = _price_sources_for_ui(self.data)
+        source_labels = _price_source_labels_from_data(self.data)
+        if self.price_grid.source_labels() != source_labels:
+            self._populate_price_grid()
+            return
+
+        self.price_grid.update_prices(
+            sources,
+            currency=_current_price_currency(self.data),
+            holdings=self.data.get("holdings") or {"TS": {}, "M": {}},
+            status_by_source=self._status_by_source_snapshot(),
+        )
 
     def on_refresh_prices(self):
         """Bouton 'Refresh les prix' -> lance le fetch asynchrone et actualise l'UI."""
@@ -5149,8 +6040,8 @@ class RevenueDialog(QDialog):
             self.btn_refresh_prices.setText("Refresh")
 
     def _recompute_totals(self):
-        """Total € = somme_s( holdings[kind][s] * price[s] ), avec price[s] = €/M unique."""
-        servers = self.data.get("servers") or {}  # {"Mikhal": 12.5, ...}
+        """Total € = Σ holdings[s] × prix_moyen_EUR(s) ; prix = moyenne EUR des sites scrapés."""
+        servers = _servers_eur_for_holdings(self.data)
         holds = self.data.get("holdings") or {"TS": {}, "M": {}}
 
         total_ts = 0.0
@@ -5164,7 +6055,7 @@ class RevenueDialog(QDialog):
         self.card_metier.setAmount(total_metier)
 
     def _open_kind_editor(self, kind: str):
-        servers_ref = self.data.get("servers") or {}  # dict[str,float]
+        servers_ref = _servers_eur_for_holdings(self.data)
         holds = (self.data.get("holdings") or {}).setdefault(kind, {})
         for srv in iter_servers_in_display_order(servers_ref.keys()):
             holds.setdefault(srv, 0)
@@ -5215,18 +6106,14 @@ class RevenueDialog(QDialog):
                 # 3) Afficher le label AVEC la date/heure ✅
                 self._set_fetch_status(f"Last update : {when}", "neutral")
 
-                # 4) Mettre à jour les montants affichés
+                # 4) Mettre à jour le tableau multi-sources
                 try:
-                    for i in range(self.list.count()):
-                        it = self.list.item(i)
-                        row = self.list.itemWidget(it)
-                        if not row:
-                            continue
-                        name = row.lbl_server.text()
-                        price = float(servers.get(name, 0.0))
-                        row.setAmount(price)
-                    # 5) Appliquer les couleurs UNE SEULE FOIS (après la boucle)
-                    self._apply_status_colors()
+                    self.data["servers"] = servers
+                    with _revenue_lock:
+                        self.data["price_sources"] = dict(
+                            _revenue_data.get("price_sources") or {}
+                        )
+                    self._refresh_price_grid_from_store()
                 except Exception:
                     pass
             else:
@@ -6632,7 +7519,7 @@ class SnowMasterGUI(QWidget):
         self.configDock.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.configDock.setStyleSheet(
             "#ConfigDock QPushButton { padding:5px 8px; font-size:13px; } "
-            "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
+            # "#ConfigDock QLabel:not(#EuroBigCounter) { font-size:13px; } "
             "#ConfigDock { font-size:13px; }"
         )
 
@@ -7355,14 +8242,16 @@ class SnowMasterGUI(QWidget):
             pass
 
     def update_revenue_counter(self):
-        """Calcule la somme totale en € : (TS + Métier) * prix(serveur) sur tous les serveurs."""
+        """Total € = Σ (kamas_TS + kamas_M) × prix_moyen_EUR/M (moyenne des sites scrapés)."""
         try:
             with _revenue_lock:
-                servers = (
-                    _revenue_data.get("servers") or {}
-                )  # {"Imagiro": 8.25, ...} = €/M
-                holds = _revenue_data.get("holdings") or {"TS": {}, "M": {}}  # millions
+                snap = {
+                    "price_sources": dict(_revenue_data.get("price_sources") or {}),
+                    "servers": dict(_revenue_data.get("servers") or {}),
+                }
+                holds = _revenue_data.get("holdings") or {"TS": {}, "M": {}}
 
+            servers = _servers_eur_for_holdings(snap)
             total = 0.0
             for srv, price in servers.items():
                 p = float(price)
