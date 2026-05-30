@@ -399,6 +399,8 @@ DEFAULT_PREFS = {
         "launch_delay": 1,  # délai par défaut en secondes entre les relances
         "mode": "load_and_launch",  # comportement par défaut lors du chargement d'une config
         "overwrite_on_load": True,  # si True -> écrase les instances existantes lors du chargement d'une config
+        "scan_pid_interval_ms": 30000,  # scan léger PID/HWND (ms)
+        "scan_pid_full_every": 4,  # 1 scan complet (doublons) tous les N scans légers
     },
     # Configuration pour Discord : envoi de hook quand le voyant global passe au rouge
     "discord": {
@@ -425,7 +427,77 @@ DEFAULT_PREFS = {
         "stop": "stop.png",
         "trash": "poubelle.png",
     },
+    "ui": {
+        # Animations pulsées (ombre) sur les cartes d'instance ; si False : bordure QSS statique seulement
+        "card_animations_enabled": True,
+        "static_shadows_enabled": True,  # ombres fixes (panneau €, etc.)
+        "refresh_interval_active_ms": 1000,
+        "refresh_interval_inactive_ms": 2500,  # fenêtre inactive / minimisée
+        "bus_coalesce_ms": 300,  # regroupement des heartbeats avant refresh UI
+    },
 }
+
+
+def card_animations_enabled() -> bool:
+    """Préférence UI : ombre animée sur les cartes d'instance (sinon bordure statique uniquement)."""
+    try:
+        return bool(_prefs.get("ui", {}).get("card_animations_enabled", True))
+    except Exception:
+        return True
+
+
+def static_shadows_enabled() -> bool:
+    try:
+        return bool(_prefs.get("ui", {}).get("static_shadows_enabled", True))
+    except Exception:
+        return True
+
+
+def _sub_map_fingerprint(sub_map: dict) -> str:
+    """Empreinte structurelle (clés + alias) — le ts est rafraîchi via update_live."""
+    if not sub_map:
+        return ""
+    parts: List[str] = []
+    for sid in sorted(sub_map.keys(), key=lambda k: str(k).lower()):
+        info = sub_map[sid]
+        try:
+            if isinstance(info, dict):
+                parts.append(f"{sid}|{info.get('alias', '')}")
+            else:
+                parts.append(str(sid))
+        except Exception:
+            parts.append(str(sid))
+    return ";".join(parts)
+
+
+_save_prefs_lock = threading.Lock()
+_save_prefs_timer: Optional[threading.Timer] = None
+_save_prefs_pending: Optional[dict] = None
+SAVE_PREFS_DEBOUNCE_S = 0.4
+
+
+def _write_prefs_file(prefs: dict) -> None:
+    try:
+        with open(PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("WARN save_prefs:", e)
+
+
+def flush_save_prefs() -> None:
+    """Écrit immédiatement les préférences en attente (fermeture app, etc.)."""
+    global _save_prefs_timer, _save_prefs_pending
+    with _save_prefs_lock:
+        if _save_prefs_timer is not None:
+            try:
+                _save_prefs_timer.cancel()
+            except Exception:
+                pass
+            _save_prefs_timer = None
+        prefs = _save_prefs_pending
+        _save_prefs_pending = None
+    if prefs is not None:
+        _write_prefs_file(prefs)
 
 
 ##################################### BOT DISCORD POUR EFFACEMENT DES MESSAGES
@@ -2445,18 +2517,34 @@ def load_prefs() -> dict:
     # Fichier absent : on le crée avec les valeurs par défaut
     default = json.loads(json.dumps(DEFAULT_PREFS))
     try:
-        save_prefs(default)
+        save_prefs(default, immediate=True)
     except Exception:
         pass
     return default
 
 
-def save_prefs(prefs: dict):
-    try:
-        with open(PREFS_FILE, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("WARN save_prefs:", e)
+def save_prefs(prefs: dict, immediate: bool = False):
+    """Sauvegarde settings.json (debounce 400 ms sauf immediate=True)."""
+    global _save_prefs_timer, _save_prefs_pending
+    with _save_prefs_lock:
+        _save_prefs_pending = prefs
+        if _save_prefs_timer is not None:
+            try:
+                _save_prefs_timer.cancel()
+            except Exception:
+                pass
+            _save_prefs_timer = None
+        if not immediate:
+
+            def _flush():
+                flush_save_prefs()
+
+            _save_prefs_timer = threading.Timer(SAVE_PREFS_DEBOUNCE_S, _flush)
+            _save_prefs_timer.daemon = True
+            _save_prefs_timer.start()
+            return
+        _save_prefs_pending = None
+    _write_prefs_file(prefs)
 
 
 def get_bot_root(prefs: dict) -> str:
@@ -3058,6 +3146,13 @@ else:
     APP_DISPLAY_NAME = "SnowMaster"  # nom de cette application (orchestrateur)
     APP_EXE_NAME = "SnowBot"  # nom de l'exe des instances
     APP_ALERT_TAG = "SNOWMASTER"
+
+
+def format_instance_window_title(title: str) -> str:
+    """Titre fenêtre du client orchestré ({title} - SnowBot|AnkaBot), selon appVariant."""
+    t = (title or "").strip()
+    client = APP_EXE_NAME or "SnowBot"
+    return f"{t} - {client}" if t else client
 
 
 # Identifiant de build : généré automatiquement en CI dans version.txt (PyInstaller --add-data).
@@ -4833,6 +4928,9 @@ class StatusDot(QLabel):
     def set_color(self, color_hex: str):
         if not (color_hex or "").strip():
             color_hex = CLR_GREY
+        if getattr(self, "_last_color", None) == color_hex:
+            return
+        self._last_color = color_hex
         self.setStyleSheet(
             f"background-color:{color_hex}; border-radius:{self.d//2}px;"
         )
@@ -4986,6 +5084,7 @@ class ReferencePriceGrid(QWidget):
         self._status_by_source: Dict[str, Dict[str, str]] = {}
         self._rows: Dict[str, ReferencePriceRow] = {}
         self._footer: Optional[ReferencePriceRow] = None
+        self._display_data_fp: Optional[tuple] = None
 
         self._root_lay = QVBoxLayout(self)
         self._root_lay.setContentsMargins(0, 0, 0, 0)
@@ -5171,6 +5270,31 @@ class ReferencePriceGrid(QWidget):
         if status_by_source is not None:
             self._status_by_source = status_by_source
         self._sources = sources
+        fp = (
+            self._currency,
+            self._display_mode,
+            tuple(
+                sorted(
+                    (site, tuple(sorted((srv, tuple(sorted(vals.items()))) for srv, vals in smap.items())))
+                    for site, smap in (self._sources or {}).items()
+                )
+            ),
+            tuple(
+                sorted(
+                    (site, tuple(sorted(st.items())))
+                    for site, st in (self._status_by_source or {}).items()
+                )
+            ),
+            tuple(
+                sorted(
+                    (kind, tuple(sorted((srv, int(qty)) for srv, qty in hm.items())))
+                    for kind, hm in (self._holdings or {}).items()
+                )
+            ),
+        )
+        if fp == getattr(self, "_display_data_fp", None):
+            return
+        self._display_data_fp = fp
         self._refresh_all_display()
 
 
@@ -6456,30 +6580,16 @@ class InstanceItemWidget(QWidget):
         self.setObjectName("InstanceCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        # Aura / glow pour les instances actives / en warning / en erreur / en recovery / manuelles
+        # Aura / glow (créé à la demande si animations activées dans les prefs)
         self._active = False
         self._glow_mode = "none"  # "green", "yellow", "red", "purple", "blue" ou "none"
-        try:
-            self._glow_effect = QGraphicsDropShadowEffect(self)
-            self._glow_effect.setOffset(0, 0)
-            self._glow_effect.setBlurRadius(0)
-            self._glow_effect.setColor(QColor(0, 0, 0, 0))
-            self.setGraphicsEffect(self._glow_effect)
-
-            # Animation de couleur pour un effet de pulsation moderne
-            self._glow_anim = QPropertyAnimation(self._glow_effect, b"color", self)
-            # Légèrement plus lente et cyclique (pas de "reset" brutal en fin de cycle)
-            self._glow_anim.setDuration(1700)
-            base_color = QColor(74, 222, 128, 28)  # vert menthe très doux
-            peak_color = QColor(52, 211, 153, 150)  # vert menthe plus lumineux
-            self._glow_anim.setStartValue(base_color)
-            self._glow_anim.setKeyValueAt(0.5, peak_color)
-            self._glow_anim.setEndValue(base_color)  # boucle fluide: fin == début
-            self._glow_anim.setEasingCurve(QEasingCurve.InOutSine)
-            self._glow_anim.setLoopCount(-1)
-        except Exception:
-            self._glow_effect = None
-            self._glow_anim = None
+        self._glow_effect = None
+        self._glow_anim = None
+        # Cache pour éviter repaint / unpolish+polish si rien n'a changé (timer 1s)
+        self._cached_color: Optional[str] = None
+        self._cached_extra: Optional[str] = None
+        self._cached_sev: Optional[str] = None
+        self._cached_anim_on: Optional[bool] = None
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 6, 10, 6)
@@ -6558,90 +6668,160 @@ class InstanceItemWidget(QWidget):
         self.btn_kill.clicked.connect(lambda: self.requestKill.emit(self.title_id))
         self.btn_del.clicked.connect(lambda: self.requestDelete.emit(self.title_id))
 
-    def update_status(self, color_hex: str, extra_text: str = ""):
-        self.dot.set_color(color_hex)
-        self.lbl_extra.setText(extra_text)
+    def _init_glow_widgets(self):
+        """Crée l'effet d'ombre et l'animation (une seule fois par carte)."""
+        if self._glow_effect is not None:
+            return
+        self._glow_effect = QGraphicsDropShadowEffect(self)
+        self._glow_effect.setOffset(0, 0)
+        self._glow_effect.setBlurRadius(0)
+        self._glow_effect.setColor(QColor(0, 0, 0, 0))
+        self._glow_anim = QPropertyAnimation(self._glow_effect, b"color", self)
+        self._glow_anim.setDuration(1700)
+        self._glow_anim.setEasingCurve(QEasingCurve.InOutSine)
+        self._glow_anim.setLoopCount(-1)
 
-        # Met à jour la "propriété d'aura" en fonction de la couleur du voyant
-        # -> vert = active, jaune = warning, rouge = error, violet = recovery, bleu = manuel
+    def _clear_card_glow(self):
+        """Arrête l'animation et retire l'ombre (mode bordure statique uniquement)."""
         try:
-            sev = "none"
-            if color_hex:
-                ch = color_hex.lower()
-                if ch == CLR_GREEN.lower():
-                    sev = "green"
-                elif ch == CLR_YELLOW.lower():
-                    sev = "yellow"
-                elif ch == CLR_RED.lower():
-                    sev = "red"
-                elif ch == CLR_PURPLE.lower():
-                    sev = "purple"
-                elif ch == CLR_BLUE.lower():
-                    sev = "blue"
+            if self._glow_anim is not None:
+                self._glow_anim.stop()
+            self.setGraphicsEffect(None)
+            if self._glow_effect is not None:
+                self._glow_effect.setBlurRadius(0)
+                self._glow_effect.setColor(QColor(0, 0, 0, 0))
+            self._active = False
+            self._glow_mode = "none"
+        except Exception:
+            pass
 
-            # Propriétés QSS
-            self.setProperty("state", sev)
-            self.setProperty("active", "true" if sev == "green" else "false")
-            self.setProperty("warning", "true" if sev == "yellow" else "false")
-            self.setProperty("error", "true" if sev == "red" else "false")
+    @staticmethod
+    def _sev_from_color(color_hex: str) -> str:
+        if not color_hex:
+            return "none"
+        ch = color_hex.lower()
+        if ch == CLR_GREEN.lower():
+            return "green"
+        if ch == CLR_YELLOW.lower():
+            return "yellow"
+        if ch == CLR_RED.lower():
+            return "red"
+        if ch == CLR_PURPLE.lower():
+            return "purple"
+        if ch == CLR_BLUE.lower():
+            return "blue"
+        return "none"
 
-            # Gestion du glow animé : démarrer/arrêter / changer la couleur selon la sévérité
-            if sev != self._glow_mode:
-                # Stopper l'ancien mode si besoin
+    def _status_unchanged(
+        self, color_hex: str, extra_text: str, sev: str, anim_on: bool
+    ) -> bool:
+        if self._cached_color != color_hex:
+            return False
+        if self._cached_extra != extra_text:
+            return False
+        if self._cached_sev != sev:
+            return False
+        if self._cached_anim_on != anim_on:
+            return False
+        if anim_on:
+            if sev in ("green", "yellow", "red", "purple", "blue"):
+                return self._glow_mode == sev
+            return self._glow_mode == "none"
+        return self.graphicsEffect() is None and self._glow_mode == "none"
+
+    def _remember_status_cache(
+        self, color_hex: str, extra_text: str, sev: str, anim_on: bool
+    ) -> None:
+        self._cached_color = color_hex
+        self._cached_extra = extra_text
+        self._cached_sev = sev
+        self._cached_anim_on = anim_on
+
+    def update_status(
+        self, color_hex: str, extra_text: str = "", *, force: bool = False
+    ):
+        if not (color_hex or "").strip():
+            color_hex = CLR_GREY
+        extra_text = extra_text or ""
+        sev = self._sev_from_color(color_hex)
+        anim_on = card_animations_enabled()
+
+        if not force and self._status_unchanged(color_hex, extra_text, sev, anim_on):
+            return
+
+        self.dot.set_color(color_hex)
+        if self.lbl_extra.text() != extra_text:
+            self.lbl_extra.setText(extra_text)
+
+        try:
+            style_dirty = False
+            for prop, val in (
+                ("state", sev),
+                ("active", "true" if sev == "green" else "false"),
+                ("warning", "true" if sev == "yellow" else "false"),
+                ("error", "true" if sev == "red" else "false"),
+            ):
+                if str(self.property(prop) or "") != val:
+                    self.setProperty(prop, val)
+                    style_dirty = True
+
+            if not anim_on:
+                if self._glow_mode != "none" or self.graphicsEffect() is not None:
+                    self._clear_card_glow()
+                    style_dirty = True
+            elif sev != self._glow_mode:
                 if self._glow_anim is not None:
                     self._glow_anim.stop()
 
-                if (
-                    sev in ("green", "yellow", "red", "purple", "blue")
-                    and self._glow_effect is not None
-                    and self._glow_anim is not None
-                ):
-                    # Choix des couleurs selon la sévérité
+                if sev in ("green", "yellow", "red", "purple", "blue"):
+                    self._init_glow_widgets()
                     if sev == "green":
                         base_color = QColor(74, 222, 128, 28)
                         peak_color = QColor(52, 211, 153, 150)
                     elif sev == "yellow":
-                        base_color = QColor(252, 211, 77, 28)  # jaune doux
-                        peak_color = QColor(250, 204, 21, 150)  # jaune soleil
+                        base_color = QColor(252, 211, 77, 28)
+                        peak_color = QColor(250, 204, 21, 150)
                     elif sev == "red":
-                        base_color = QColor(248, 113, 113, 28)  # rouge doux
-                        peak_color = QColor(239, 68, 68, 150)  # rouge plus intense
+                        base_color = QColor(248, 113, 113, 28)
+                        peak_color = QColor(239, 68, 68, 150)
                     elif sev == "purple":
-                        base_color = QColor(196, 181, 253, 28)  # violet doux
-                        peak_color = QColor(167, 139, 250, 150)  # violet plus lumineux
+                        base_color = QColor(196, 181, 253, 28)
+                        peak_color = QColor(167, 139, 250, 150)
                     else:  # blue
-                        base_color = QColor(96, 165, 250, 28)  # bleu doux
-                        peak_color = QColor(59, 130, 246, 150)  # bleu plus intense
+                        base_color = QColor(96, 165, 250, 28)
+                        peak_color = QColor(59, 130, 246, 150)
 
                     self._glow_anim.setStartValue(base_color)
                     self._glow_anim.setKeyValueAt(0.5, peak_color)
                     self._glow_anim.setEndValue(base_color)
-
                     self._glow_effect.setBlurRadius(26)
+                    self.setGraphicsEffect(self._glow_effect)
                     self._glow_anim.start()
                     self._active = True
+                    self._glow_mode = sev
+                    style_dirty = True
                 else:
-                    # Aucun glow (none)
-                    self._active = False
-                    if self._glow_effect is not None:
-                        self._glow_effect.setColor(QColor(0, 0, 0, 0))
-                        self._glow_effect.setBlurRadius(0)
+                    self._clear_card_glow()
+                    style_dirty = True
 
-                self._glow_mode = sev
+            if style_dirty:
+                self.style().unpolish(self)
+                self.style().polish(self)
 
-            # Reforcer le rafraîchissement du style QSS
-            self.style().unpolish(self)
-            self.style().polish(self)
+            self._remember_status_cache(color_hex, extra_text, sev, anim_on)
         except Exception:
             pass
 
     def set_title(self, title: str):
         self.title_id = title
-        shead = title
-        self.lbl_title.setText(shead)
+        if self.lbl_title.text() != title:
+            self.lbl_title.setText(title)
 
     def set_selected(self, selected: bool):
-        self.setProperty("selected", "true" if selected else "false")
+        sel = "true" if selected else "false"
+        if str(self.property("selected") or "false") == sel:
+            return
+        self.setProperty("selected", sel)
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -6738,6 +6918,12 @@ class SubctrlItemWidget(QWidget):
             )
         except Exception:
             self.lbl_last.setText("-")
+
+
+    def update_live(self, alias: str, sid: str, last_ts: float, color_hex: str):
+        """Met à jour texte + voyant sans reconstruire le widget."""
+        self.set(alias, sid, last_ts)
+        self.dot.set_color(color_hex)
 
 
 class ItemPerWidgetList(QListWidget):
@@ -7234,6 +7420,33 @@ class SnowMasterGUI(QWidget):
         )
         self.chk_discord_alert.stateChanged.connect(self.on_toggle_discord_alert)
 
+        self.chk_card_animations = QCheckBox("Animations des cartes")
+        try:
+            init_card_anim = bool(
+                _prefs.get("ui", {}).get("card_animations_enabled", True)
+            )
+        except Exception:
+            init_card_anim = True
+        self.chk_card_animations.setChecked(init_card_anim)
+        self.chk_card_animations.setToolTip(
+            "Coché : bordure colorée + ombre pulsée.\n"
+            "Décoché : bordure colorée statique uniquement (moins de charge CPU)."
+        )
+        self.chk_card_animations.stateChanged.connect(self.on_toggle_card_animations)
+
+        self.chk_static_shadows = QCheckBox("Ombres UI (panneau €)")
+        try:
+            init_static_shadows = bool(
+                _prefs.get("ui", {}).get("static_shadows_enabled", True)
+            )
+        except Exception:
+            init_static_shadows = True
+        self.chk_static_shadows.setChecked(init_static_shadows)
+        self.chk_static_shadows.setToolTip(
+            "Désactivé : retire les ombres portées fixes (léger gain CPU/GPU)."
+        )
+        self.chk_static_shadows.stateChanged.connect(self.on_toggle_static_shadows)
+
         # Lecture initiale des prefs pour les instances
         instances_prefs = _prefs.get("instances", {})
         default_delay = int(instances_prefs.get("launch_delay", 1))
@@ -7329,6 +7542,8 @@ class SnowMasterGUI(QWidget):
 
         inst_group_collapsible.addWidget(self.chk_auto_relaunch)
         inst_group_collapsible.addWidget(self.chk_discord_alert)
+        inst_group_collapsible.addWidget(self.chk_card_animations)
+        inst_group_collapsible.addWidget(self.chk_static_shadows)
         # inst_group_collapsible.addWidget(self.btn_save_cfg)
         # inst_group_collapsible.addWidget(self.btn_load_cfg)
         # Checkbox: overwrite existing instances when loading a config
@@ -7498,16 +7713,16 @@ class SnowMasterGUI(QWidget):
         self.panel_euros.setCursor(Qt.PointingHandCursor)
         self.panel_euros.clicked.connect(self.open_revenue_window)
 
-        # Ombre douce (si l'import manque : from PySide6.QtWidgets import QGraphicsDropShadowEffect ; from PySide6.QtGui import QColor)
-        try:
-            shadow = QGraphicsDropShadowEffect(self.panel_euros)
-            shadow.setBlurRadius(24)
-            shadow.setXOffset(0)
-            shadow.setYOffset(8)
-            shadow.setColor(QColor(16, 185, 129, 90))
-            self.panel_euros.setGraphicsEffect(shadow)
-        except Exception:
-            pass
+        if static_shadows_enabled():
+            try:
+                shadow = QGraphicsDropShadowEffect(self.panel_euros)
+                shadow.setBlurRadius(24)
+                shadow.setXOffset(0)
+                shadow.setYOffset(8)
+                shadow.setColor(QColor(16, 185, 129, 90))
+                self.panel_euros.setGraphicsEffect(shadow)
+            except Exception:
+                pass
 
         # Bouton argent (fixe en bas)
         cfg_v.addWidget(self.panel_euros)
@@ -7662,20 +7877,42 @@ class SnowMasterGUI(QWidget):
         root.addWidget(splitter)
 
         # Timer / autopilot
+        self._list_widths_dirty = True
+        self._last_selection_key: Optional[frozenset] = None
+        self._subs_list_title: Optional[str] = None
+        self._subs_list_fp: Optional[str] = None
+        self._details_cache_key: Optional[tuple] = None
+        self._instances_count_cache: Optional[str] = None
+        self._pending_bus_titles: set = set()
+        self._scan_pid_light_counter = 0
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_cards_and_details)
-        self.timer.start(1000)
+        self._sync_refresh_timer_interval()
+
         self.timer_autopilot = QTimer(self)
         self.timer_autopilot.timeout.connect(self.evaluate_autopilot_periodic)
         self.timer_autopilot.start(30000)
-        # Timer pour scan périodique des PID (toutes les minutes) - démarre seulement si auto_relaunch_enabled
+
+        scan_ms = int(_prefs.get("instances", {}).get("scan_pid_interval_ms", 30000))
         self.timer_pid_scan = QTimer(self)
         self.timer_pid_scan.timeout.connect(self._scan_pids_periodic)
         if self.auto_relaunch_enabled:
-            self.timer_pid_scan.start(30000)  # 30000ms = 30 secondes (plus réactif)
+            self.timer_pid_scan.start(max(5000, scan_ms))
 
-        bus.new_instance.connect(self.on_bus_update)
-        bus.instance_updated.connect(self.on_bus_update)
+        coalesce_ms = int(_prefs.get("ui", {}).get("bus_coalesce_ms", 300))
+        self._bus_coalesce_timer = QTimer(self)
+        self._bus_coalesce_timer.setSingleShot(True)
+        self._bus_coalesce_timer.timeout.connect(self._flush_bus_coalesced_updates)
+        self._bus_coalesce_timer.setInterval(max(50, coalesce_ms))
+
+        self._global_dot_debounce_timer = QTimer(self)
+        self._global_dot_debounce_timer.setSingleShot(True)
+        self._global_dot_debounce_timer.timeout.connect(self.update_global_dot)
+        self._global_dot_debounce_timer.setInterval(200)
+
+        bus.new_instance.connect(self._queue_bus_update)
+        bus.instance_updated.connect(self._queue_bus_update)
         bus.instance_removed.connect(self.on_bus_remove)
         # NOUVEAU : reset => kill + relaunch
         bus.reset_instance.connect(self.on_bus_reset_instance)
@@ -7790,6 +8027,7 @@ class SnowMasterGUI(QWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.list and event.type() == QEvent.Resize:
+            self._list_widths_dirty = True
             self._adjust_item_widths()
         return super().eventFilter(obj, event)
 
@@ -7872,7 +8110,9 @@ class SnowMasterGUI(QWidget):
         """Active/désactive les boutons de la carte selon l'état courant."""
         try:
             running = self._is_instance_running(inst)
-            # bouton "Relancer" de la carte
+            if getattr(card_widget, "_last_reload_running", None) == running:
+                return
+            card_widget._last_reload_running = running
             if hasattr(card_widget, "btn_reload") and card_widget.btn_reload:
                 card_widget.btn_reload.setEnabled(not running)
                 card_widget.btn_reload.setToolTip(
@@ -7894,10 +8134,78 @@ class SnowMasterGUI(QWidget):
         save_prefs(_prefs)
 
     def _adjust_item_widths(self):
+        if not getattr(self, "_list_widths_dirty", True):
+            return
+        self._list_widths_dirty = False
         for i in range(self.list.count()):
             it = self.list.item(i)
             if it:
                 it.setSizeHint(QSize(CARD_WIDTH, CARD_HEIGHT))
+
+    def _sync_refresh_timer_interval(self):
+        try:
+            if self.isMinimized() or not self.isActiveWindow():
+                ms = int(_prefs.get("ui", {}).get("refresh_interval_inactive_ms", 2500))
+            else:
+                ms = int(_prefs.get("ui", {}).get("refresh_interval_active_ms", 1000))
+        except Exception:
+            ms = 1000
+        ms = max(500, ms)
+        if self.timer.interval() != ms:
+            self.timer.setInterval(ms)
+        if not self.timer.isActive():
+            self.timer.start(ms)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        try:
+            if event.type() in (
+                QEvent.Type.WindowStateChange,
+                QEvent.Type.ActivationChange,
+            ):
+                self._sync_refresh_timer_interval()
+        except Exception:
+            pass
+
+    def _schedule_global_dot_update(self):
+        try:
+            if not self._global_dot_debounce_timer.isActive():
+                self._global_dot_debounce_timer.start()
+        except Exception:
+            self.update_global_dot()
+
+    def _queue_bus_update(self, title: str):
+        if title:
+            self._pending_bus_titles.add(title)
+        try:
+            if not self._bus_coalesce_timer.isActive():
+                ms = int(_prefs.get("ui", {}).get("bus_coalesce_ms", 300))
+                self._bus_coalesce_timer.start(max(50, ms))
+        except Exception:
+            self._flush_bus_coalesced_updates()
+
+    def _flush_bus_coalesced_updates(self):
+        titles = list(self._pending_bus_titles)
+        self._pending_bus_titles.clear()
+        if not titles:
+            return
+        selected = self.selected_title()
+        need_details = False
+        need_subs = False
+        for t in titles:
+            with _state_lock:
+                inst = _instances.get(t)
+            if inst:
+                self._ensure_item(t, inst)
+            if t == selected:
+                need_details = True
+                need_subs = True
+        if need_details:
+            self.update_selected_details(force=True)
+        if need_subs:
+            self.update_sub_list()
+        self._schedule_global_dot_update()
+        self.update_instances_count()
 
     @staticmethod
     def fmt_last_update(ts: float, with_label: bool = False) -> str:
@@ -8283,6 +8591,9 @@ class SnowMasterGUI(QWidget):
         active_label = "instance" if active == 1 else "instances"
         txt = f"{active} {active_label}"
 
+        if txt == getattr(self, "_instances_count_cache", None):
+            return
+        self._instances_count_cache = txt
         try:
             self.lbl_instances_big.setText(txt)
         except Exception:
@@ -8464,6 +8775,7 @@ class SnowMasterGUI(QWidget):
 
             self.list.addItem(it)
             self.list.setItemWidget(it, card)
+            self._list_widths_dirty = True
 
         card: InstanceItemWidget = self.list.itemWidget(it)
         if card:
@@ -8504,6 +8816,10 @@ class SnowMasterGUI(QWidget):
             pass
 
     def refresh_list_full(self):
+        self._list_widths_dirty = True
+        self._last_selection_key = None
+        self._subs_list_title = None
+        self._subs_list_fp = None
         self.list.clear()
         for title in self._ordered_titles_snapshot():
             with _state_lock:
@@ -8526,6 +8842,7 @@ class SnowMasterGUI(QWidget):
 
     def refresh_cards_and_details(self):
         try:
+            self._sync_refresh_timer_interval()
             titles = []
             for i in range(self.list.count()):
                 it = self.list.item(i)
@@ -8550,9 +8867,7 @@ class SnowMasterGUI(QWidget):
             self.update_sub_list()
             self.update_card_selection_styles()
             self.update_instances_count()
-            self.update_global_dot()
-            # Ancien système de relance auto désactivé - remplacé par _scan_pids_periodic (scan toutes les minutes)
-            # self._schedule_auto_relaunch_scan(instances_snapshot)
+            self._schedule_global_dot_update()
 
         except Exception as e:
             print("Timer refresh error:", e)
@@ -8571,31 +8886,29 @@ class SnowMasterGUI(QWidget):
         self.update_card_selection_styles()
 
     def update_card_selection_styles(self):
-        cur = self.list.currentItem()
+        sel_key = frozenset(
+            (it.data(Qt.UserRole), it.isSelected())
+            for i in range(self.list.count())
+            if (it := self.list.item(i)) and it.data(Qt.UserRole)
+        )
+        if sel_key == getattr(self, "_last_selection_key", None):
+            return
+        self._last_selection_key = sel_key
         for i in range(self.list.count()):
             it = self.list.item(i)
             card = self.list.itemWidget(it)
             if not card:
                 continue
-            # selected = (it is cur)
-            selected = (
-                it.isSelected()
-            )  # <-- prend la vraie sélection, pas juste current
-            card.setProperty("selected", selected)
-            card.style().unpolish(card)
-            card.style().polish(card)
-            card.update()
+            card.set_selected(it.isSelected())
 
-    def update_selected_details(self):
+    def update_selected_details(self, force: bool = False):
         """Met à jour le panneau 'Détails de l’instance' selon l’instance sélectionnée."""
-        # Protection contre les appels trop précoces (avant création des widgets)
         if not hasattr(self, "lbl_script"):
             return
 
         title = self.selected_title()
         self.selected_instance_title = title
 
-        # Si aucune instance sélectionnée → on vide les champs
         if not title:
             if hasattr(self, "lbl_title"):
                 self.lbl_title.setText("-")
@@ -8608,60 +8921,78 @@ class SnowMasterGUI(QWidget):
             self.lbl_last_reset.setText("-")
             if hasattr(self, "btn_rename_instance"):
                 self.btn_rename_instance.setEnabled(False)
+            self._details_cache_key = None
             return
 
-        # Récupération de l’instance
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
                 return
 
-        # --- Mise à jour du titre ---
-        if hasattr(self, "lbl_title"):
+        try:
+            last_reset = getattr(inst, "last_reset", 0.0)
+            last_reset_txt = (
+                "-"
+                if not last_reset
+                else datetime.fromtimestamp(float(last_reset)).strftime("%H:%M")
+            )
+        except Exception:
+            last_reset_txt = "-"
+
+        script_name = (
+            os.path.basename(inst.controller_path) if inst.controller_path else "-"
+        )
+        status_txt = self.fmt_last_update(
+            self._effective_last_update_ts(inst), with_label=False
+        )
+        pid_txt = str(inst.pid) if inst.pid else "-"
+        try:
+            running = self._is_instance_running(inst)
+        except Exception:
+            running = False
+
+        cache_key = (
+            title,
+            inst.title,
+            script_name,
+            pid_txt,
+            status_txt,
+            last_reset_txt,
+            running,
+        )
+        if not force and cache_key == getattr(self, "_details_cache_key", None):
+            return
+        self._details_cache_key = cache_key
+
+        if hasattr(self, "lbl_title") and self.lbl_title.text() != inst.title:
             self.lbl_title.setText(inst.title)
-        if hasattr(self, "edit_title"):
+        if hasattr(self, "edit_title") and self.edit_title.text() != inst.title:
             self.edit_title.blockSignals(True)
             self.edit_title.setText(inst.title)
             self.edit_title.setCursorPosition(len(inst.title))
             self.edit_title.blockSignals(False)
 
-        # --- Script et PID ---
-        script_name = (
-            os.path.basename(inst.controller_path) if inst.controller_path else "-"
-        )
-        self.lbl_script.setText(script_name)
-        self.lbl_pid.setText(str(inst.pid) if inst.pid else "-")
+        if self.lbl_script.text() != script_name:
+            self.lbl_script.setText(script_name)
+        if self.lbl_pid.text() != pid_txt:
+            self.lbl_pid.setText(pid_txt)
+        if self.lbl_last_reset.text() != last_reset_txt:
+            self.lbl_last_reset.setText(last_reset_txt)
+        if self.lbl_status.text() != status_txt:
+            self.lbl_status.setText(status_txt)
 
-        # --- Last Reset ---
         try:
-            last_reset = getattr(inst, "last_reset", 0.0)
-            if not last_reset:
-                self.lbl_last_reset.setText("-")
-            else:
-                self.lbl_last_reset.setText(
-                    datetime.fromtimestamp(float(last_reset)).strftime("%H:%M")
-                )
-        except Exception:
-            self.lbl_last_reset.setText("-")
-
-        # --- Last Update ---
-        self.lbl_status.setText(
-            self.fmt_last_update(self._effective_last_update_ts(inst), with_label=False)
-        )
-
-        # --- État de l’instance ---
-        try:
-            running = self._is_instance_running(inst)
             self.btn_reload_d.setEnabled(not running)
-            self.btn_reload_d.setToolTip(
+            tip = (
                 "L'instance tourne déjà (heartbeat/PID/HWND OK)"
                 if running
                 else "Relancer l'instance arrêtée"
             )
+            if self.btn_reload_d.toolTip() != tip:
+                self.btn_reload_d.setToolTip(tip)
         except Exception:
             pass
 
-        # --- Activation du bouton de renommage ---
         if hasattr(self, "btn_rename_instance"):
             self.btn_rename_instance.setEnabled(True)
 
@@ -8732,6 +9063,7 @@ class SnowMasterGUI(QWidget):
             if hasattr(w, "sid") and w.sid == sid:
                 self.subs_list.takeItem(i)
                 break
+        self._subs_list_fp = None
 
         # Met à jour les voyants / états de l'instance
         try:
@@ -8744,16 +9076,65 @@ class SnowMasterGUI(QWidget):
         # self.refresh_instance_cards()
         self.refresh_cards_and_details()
 
-    def update_sub_list(self):
+    def update_sub_list(self, force: bool = False):
         title = self.selected_title()
-        self.subs_list.clear()
         if not title:
+            self._subs_list_title = None
+            self._subs_list_fp = None
+            if self.subs_list.count():
+                self.subs_list.clear()
             return
         with _state_lock:
             inst = _instances.get(title)
             if not inst:
                 return
-            # sort by stable sid (string)
+            fp = _sub_map_fingerprint(inst.sub_map)
+            stopped = inst.stopped
+
+        if (
+            not force
+            and title == getattr(self, "_subs_list_title", None)
+            and fp == getattr(self, "_subs_list_fp", None)
+        ):
+            with _state_lock:
+                inst_live = _instances.get(title)
+                if not inst_live:
+                    return
+                sub_snapshot = dict(inst_live.sub_map)
+                stopped_live = inst_live.stopped
+            for i in range(self.subs_list.count()):
+                it = self.subs_list.item(i)
+                w = self.subs_list.itemWidget(it)
+                if not isinstance(w, SubctrlItemWidget):
+                    continue
+                info = sub_snapshot.get(w.sid)
+                if info is None:
+                    continue
+                try:
+                    ts = (
+                        float(info.get("ts"))
+                        if isinstance(info, dict) and info.get("ts") is not None
+                        else float(info)
+                    )
+                    alias = (
+                        str(info.get("alias", w.sid))
+                        if isinstance(info, dict)
+                        else str(w.sid)
+                    )
+                except Exception:
+                    ts = 0.0
+                    alias = str(w.sid)
+                color = self.sub_status_color(ts, stopped_live)
+                w.update_live(alias, w.sid, ts, color)
+            return
+
+        self._subs_list_title = title
+        self._subs_list_fp = fp
+        self.subs_list.clear()
+        with _state_lock:
+            inst = _instances.get(title)
+            if not inst:
+                return
             items = sorted(inst.sub_map.items(), key=lambda kv: str(kv[0]).lower())
             for sid, info in items:
                 it = QListWidgetItem()
@@ -8891,6 +9272,7 @@ class SnowMasterGUI(QWidget):
         if it:
             row = self.list.row(it)
             self.list.takeItem(row)
+            self._list_widths_dirty = True
 
         # mettre à jour les panneaux/details
         self.update_selected_details()
@@ -9907,17 +10289,6 @@ class SnowMasterGUI(QWidget):
         t = threading.Thread(target=_run_and_monitor, daemon=True)
         t.start()
 
-    def on_bus_update(self, title: str):
-        with _state_lock:
-            inst = _instances.get(title)
-            if inst:
-                self._ensure_item(title, inst)
-        if self.selected_title() == title:
-            self.update_selected_details()
-            self.update_sub_list()
-        self.update_global_dot()
-        self.update_instances_count()
-
     def _run_async(self, func, *args, **kwargs):
         def _job():
             try:
@@ -9937,39 +10308,52 @@ class SnowMasterGUI(QWidget):
         pass
 
     def _scan_pids_periodic(self):
-        """Scan périodique optimisé - exécute le travail lourd dans un thread background."""
+        """Scan périodique : léger (PID/HWND) + complet (doublons) tous les N ticks."""
         if not self.auto_relaunch_enabled:
             return
-        # Lancer le scan dans un thread background pour ne pas bloquer l'UI
-        self._run_async(self._scan_pids_worker)
+        self._scan_pid_light_counter = getattr(self, "_scan_pid_light_counter", 0) + 1
+        full_every = max(
+            1, int(_prefs.get("instances", {}).get("scan_pid_full_every", 4))
+        )
+        do_full = self._scan_pid_light_counter % full_every == 0
+        self._run_async(lambda full=do_full: self._scan_pids_worker(do_full=full))
 
-    def _scan_pids_worker(self):
+    def _scan_pids_worker(self, do_full: bool = True):
         """Worker thread pour le scan des PIDs - NE JAMAIS appeler directement depuis le thread UI."""
         try:
-            scan_log(f"[SCAN_PIDS] ========== Début du scan ==========")
+            scan_log(
+                f"[SCAN_PIDS] ========== Début du scan ({'complet' if do_full else 'léger'}) =========="
+            )
 
-            # 1) Traiter d'abord les demandes de reset en attente
             self._process_pending_resets()
 
-            # 2) Scanner les processus UNE SEULE FOIS pour toutes les instances
-            try:
-                all_processes = scan_snowbot_processes_by_cmdline(verbose=False)
-                scan_log(
-                    f"[SCAN_PIDS] {len(all_processes)} processus {APP_EXE_NAME} trouvés"
-                )
-            except Exception as e:
-                scan_log(f"[SCAN_PIDS] Erreur scan processus: {e}")
-                app_log_error(f"[SCAN_PIDS] Erreur scan processus: {e}")
-                all_processes = {}
-
-            # Construire un index par titre pour détection rapide des doublons
             processes_by_title: Dict[str, List[dict]] = {}
-            for info in all_processes.values():
-                proc_title = str(info.get("title") or "").strip()
-                if proc_title:
-                    if proc_title not in processes_by_title:
-                        processes_by_title[proc_title] = []
-                    processes_by_title[proc_title].append(info)
+            if do_full:
+                known_titles: set = set()
+                with _state_lock:
+                    for t, inst in _instances.items():
+                        if not inst.stopped:
+                            known_titles.add(t)
+                try:
+                    all_processes = scan_snowbot_processes_by_cmdline(
+                        verbose=False, known_titles=known_titles
+                    )
+                    scan_log(
+                        f"[SCAN_PIDS] {len(all_processes)} processus {APP_EXE_NAME} trouvés (scan complet)"
+                    )
+                except Exception as e:
+                    scan_log(f"[SCAN_PIDS] Erreur scan processus: {e}")
+                    app_log_error(f"[SCAN_PIDS] Erreur scan processus: {e}")
+                    all_processes = {}
+
+                for info in all_processes.values():
+                    proc_title = str(info.get("title") or "").strip()
+                    if proc_title:
+                        if proc_title not in processes_by_title:
+                            processes_by_title[proc_title] = []
+                        processes_by_title[proc_title].append(info)
+            else:
+                scan_log("[SCAN_PIDS] Scan léger : pas d'énumération globale des processus")
 
             # Afficher les doublons détectés
             duplicates_found = {
@@ -10055,9 +10439,10 @@ class SnowMasterGUI(QWidget):
                         )
                         continue
 
-                    # Vérifier les doublons avec le cache
-                    title_procs = processes_by_title.get(title, [])
-                    if len(title_procs) > 1:
+                    title_procs = (
+                        processes_by_title.get(title, []) if do_full else []
+                    )
+                    if do_full and len(title_procs) > 1:
                         scan_log(
                             f"[SCAN_PIDS] '{title}': ⚠️ DOUBLONS détectés ({len(title_procs)} processus)"
                         )
@@ -10521,20 +10906,22 @@ class SnowMasterGUI(QWidget):
     def closeEvent(self, event):
         global _discord_bot
 
-        # Arrêter le bot Discord (rapide, sans attendre)
+        try:
+            flush_save_prefs()
+        except Exception:
+            pass
+
         try:
             _discord_bot.stop()
         except Exception:
-            pass  # Ignorer les erreurs pour fermer rapidement
+            pass
 
-        # Arrêter les threads en arrière-plan (sans attendre)
         try:
             if hasattr(self, "_bg_executor"):
                 self._bg_executor.shutdown(wait=False)
         except Exception:
             pass
 
-        # Fermeture immédiate
         super().closeEvent(event)
 
     def on_bus_goodbye_kill(self, title: str):
@@ -10554,9 +10941,11 @@ class SnowMasterGUI(QWidget):
         self.auto_relaunch_enabled = self.chk_auto_relaunch.isChecked()
         _prefs["autoRelaunch"] = bool(self.auto_relaunch_enabled)
         save_prefs(_prefs)
-        # Activer/désactiver le timer de scan PID selon la checkbox
         if self.auto_relaunch_enabled:
-            self.timer_pid_scan.start(30000)  # 30 secondes (plus réactif)
+            scan_ms = max(
+                5000, int(_prefs.get("instances", {}).get("scan_pid_interval_ms", 30000))
+            )
+            self.timer_pid_scan.start(scan_ms)
         else:
             self.timer_pid_scan.stop()
 
@@ -10565,6 +10954,53 @@ class SnowMasterGUI(QWidget):
         self.discord_alert_enabled = self.chk_discord_alert.isChecked()
         _prefs.setdefault("discord", {})["enabled"] = bool(self.discord_alert_enabled)
         save_prefs(_prefs)
+
+    def on_toggle_card_animations(self, _state):
+        """Active/désactive les ombres animées sur les cartes d'instance."""
+        val = bool(self.chk_card_animations.isChecked())
+        _prefs.setdefault("ui", {})["card_animations_enabled"] = val
+        save_prefs(_prefs)
+        self._refresh_all_instance_card_styles()
+
+    def on_toggle_static_shadows(self, _state):
+        val = bool(self.chk_static_shadows.isChecked())
+        _prefs.setdefault("ui", {})["static_shadows_enabled"] = val
+        save_prefs(_prefs)
+        try:
+            if val:
+                shadow = QGraphicsDropShadowEffect(self.panel_euros)
+                shadow.setBlurRadius(24)
+                shadow.setXOffset(0)
+                shadow.setYOffset(8)
+                shadow.setColor(QColor(16, 185, 129, 90))
+                self.panel_euros.setGraphicsEffect(shadow)
+            else:
+                self.panel_euros.setGraphicsEffect(None)
+        except Exception:
+            pass
+
+    def _refresh_all_instance_card_styles(self):
+        """Réapplique voyant + style (bordure / glow) sur toutes les cartes visibles."""
+        try:
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                if not it:
+                    continue
+                title = it.data(Qt.UserRole)
+                card = self.list.itemWidget(it)
+                if not title or not card:
+                    continue
+                with _state_lock:
+                    inst = _instances.get(title)
+                if not inst:
+                    continue
+                color = self.instance_color(inst)
+                extra = self.fmt_last_update(
+                    self._effective_last_update_ts(inst), with_label=True
+                )
+                card.update_status(color, extra, force=True)
+        except Exception as e:
+            app_log_warn(f"Rafraîchissement styles cartes: {e}")
 
     def on_toggle_overwrite_instances(self, _state):
         """Met à jour la préférence 'overwrite_on_load' lorsque l'utilisateur change la checkbox."""
@@ -11833,13 +12269,13 @@ def _log_empty(msg: str):
 
 def _set_empty_instance_window_title(main_hwnd, title, log_prefix=None):
     """
-    Renomme la fenêtre de l'instance vide en "{title} - Snowbot" de façon robuste :
+    Renomme la fenêtre de l'instance vide en "{title} - <client>" (APP_EXE_NAME) :
     - vérifie que le hwnd est valide,
     - attend un court délai après /register (l'app peut réécrire le titre),
     - plusieurs tentatives espacées pour contrer un éventuel ré-écriture par l'app.
     """
     prefix = f"[{log_prefix}]" if log_prefix else ""
-    desired = f"{title} - Snowbot"
+    desired = format_instance_window_title(title)
     if not win32gui.IsWindow(main_hwnd):
         _log_empty(f"{prefix} SetWindowText ignoré: hwnd={main_hwnd} invalide")
         return
@@ -12104,9 +12540,9 @@ def run_snowbot_flow(
             bring_to_front(main_hwnd)
         time.sleep(0.35)
 
-        # Renommer la fenêtre avec le titre de l'instance
+        # Renommer la fenêtre avec le titre de l'instance (SnowBot / AnkaBot selon appVariant)
         try:
-            win32gui.SetWindowText(main_hwnd, f"{title} - Snowbot")
+            win32gui.SetWindowText(main_hwnd, format_instance_window_title(title))
         except Exception:
             pass  # Ignorer les erreurs de renommage
 
@@ -12404,7 +12840,9 @@ def _debug_print_proc(info: dict):
     )
 
 
-def scan_snowbot_processes_by_cmdline(verbose: bool = True) -> Dict[int, dict]:
+def scan_snowbot_processes_by_cmdline(
+    verbose: bool = True, known_titles: Optional[set] = None
+) -> Dict[int, dict]:
     """
     Heuristique robuste :
       - match si nom/exe correspond à EXE configuré (préféré)
@@ -12432,72 +12870,63 @@ def scan_snowbot_processes_by_cmdline(verbose: bool = True) -> Dict[int, dict]:
         target_basename = None
 
     access_denied_count = 0
+    known_titles_norm: Optional[set] = None
+    if known_titles is not None:
+        known_titles_norm = {str(t).strip().lower() for t in known_titles if t}
 
-    for p in psutil.process_iter(["pid", "name", "exe", "username"]):
+    for p in psutil.process_iter(["pid", "name"]):
         try:
             pid = p.info.get("pid")
             if not pid or pid == me_pid:
                 continue
 
             name = (p.info.get("name") or "") or ""
-            exe = (p.info.get("exe") or "") or ""
             lname = name.lower() if name else ""
-            lexe = exe.lower() if exe else ""
 
-            # heuristiques de sélection initiale (permissif mais ciblé AnkaBot)
+            # Filtre rapide sur le nom de processus (sans lire exe/cmdline)
             matched = False
-            if target_basename:
-                try:
-                    if (
-                        lname == target_basename
-                        or os.path.basename(exe).lower() == target_basename
+            if target_basename and lname == target_basename:
+                matched = True
+            if not matched and lname in (
+                "application_v2.0.exe",
+                "defaulthandler.exe",
+                "applicationhandler.exe",
+            ):
+                matched = True
+            if not matched and not target_basename:
+                if APP_VARIANT == "ankabot":
+                    if lname == "ankabot.exe" or (
+                        "anka" in lname and "launcher" not in lname
                     ):
                         matched = True
-                except Exception:
-                    pass
-
-            if not matched:
-                base = os.path.basename(exe).lower() if exe else ""
-                # Auxiliaires connus (certains clients spawn des handlers)
-                if base in (
-                    "application_v2.0.exe",
-                    "defaulthandler.exe",
-                    "applicationhandler.exe",
-                ):
+                elif lname == "snowbot.exe" or "snowbot" in lname:
                     matched = True
-
-                # Fallback uniquement si EXE non configuré
-                if not matched and not target_basename:
-                    if APP_VARIANT == "ankamaster":
-                        # 1) vrai binaire d'AnkaBot
-                        if base == "ankabot.exe" or "ankabot.exe" in lname:
-                            matched = True
-                        # 2) éviter Ankama Launcher
-                        elif ("anka" in lname or "anka" in (lexe or "")) and (
-                            "launcher" not in lname
-                        ):
-                            matched = True
-                    else:
-                        # Snowbot
-                        if base == "snowbot.exe" or "snowbot.exe" in lname:
-                            matched = True
-                        elif "snowbot" in lname or "snowbot" in (lexe or ""):
-                            matched = True
 
             if not matched:
                 continue
 
-            # Snowbot : ne jamais inclure SnowMaster (notre GUI) comme instance
-            if APP_VARIANT == "snowbot" and (
-                "snowmaster" in lname
-                or "snowmaster" in lexe
-                or base == "snowmaster.exe"
+            try:
+                exe = p.exe() or ""
+            except Exception:
+                exe = ""
+            lexe = exe.lower() if exe else ""
+            base = os.path.basename(exe).lower() if exe else ""
+
+            # Ne jamais inclure l'orchestrateur (SnowMaster / AnkaMaster) comme instance client
+            if any(tok in lname for tok in MASTER_GUI_NAME_TOKENS) or any(
+                tok in lexe for tok in MASTER_GUI_NAME_TOKENS
+            ):
+                continue
+            if base and any(
+                base == f"{tok}.exe" for tok in MASTER_GUI_NAME_TOKENS if tok
             ):
                 continue
 
-            # optional: limiter au même user (évite system/service)
-            if me_user and p.info.get("username") and p.info.get("username") != me_user:
-                # skip other users
+            try:
+                proc_user = p.username()
+            except Exception:
+                proc_user = None
+            if me_user and proc_user and proc_user != me_user:
                 continue
 
             # récupère cmdlines du proc et de ses enfants, puis parse pour title/controller
@@ -12532,6 +12961,11 @@ def scan_snowbot_processes_by_cmdline(verbose: bool = True) -> Dict[int, dict]:
                 # stop early if both found
                 if title and controller:
                     break
+
+            if known_titles_norm is not None:
+                tnorm = (title or "").strip().lower()
+                if not tnorm or tnorm not in known_titles_norm:
+                    continue
 
             # best-effort hwnd
             try:
@@ -12582,13 +13016,26 @@ def find_processes_by_title(title: str) -> List[dict]:
     """Retourne la liste des processus AnkaBot dont l'argument --title correspond."""
     if not title:
         return []
-    try:
-        processes = scan_snowbot_processes_by_cmdline(verbose=False)
-    except Exception as e:
-        app_log_error(f"scan_snowbot_processes_by_cmdline failed: {e}")
-        return []
     title_norm = title.strip().lower()
     if not title_norm:
+        return []
+    with _state_lock:
+        inst = _instances.get(title)
+    if inst and inst.pid and is_pid_alive(inst.pid):
+        return [
+            {
+                "pid": inst.pid,
+                "hwnd": inst.hwnd,
+                "title": title,
+                "controller": inst.controller_path,
+            }
+        ]
+    try:
+        processes = scan_snowbot_processes_by_cmdline(
+            verbose=False, known_titles={title}
+        )
+    except Exception as e:
+        app_log_error(f"scan_snowbot_processes_by_cmdline failed: {e}")
         return []
     matches: List[dict] = []
     for info in processes.values():
@@ -12688,7 +13135,7 @@ def restore_running_instances_from_cmdline():
                         continue
                 else:
                     # fallback sécurité (quand `exe` n'est pas configuré)
-                    if APP_VARIANT == "ankamaster":
+                    if APP_VARIANT == "ankabot":
                         if not (base_exe == "ankabot.exe" or lname == "ankabot.exe"):
                             continue
                     else:
