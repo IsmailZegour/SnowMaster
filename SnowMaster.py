@@ -279,27 +279,6 @@ def app_log_error(msg, *args, **kwargs):
         pass
 
 
-# -------------------- Log Discord (fichier discord.log, utile en .exe sans console) --------------------
-DISCORD_LOG_PATH = os.path.join(ANKADIR, "discord.log")
-_discord_log_lock = threading.Lock()
-
-
-def discord_log(msg: str):
-    """Append une ligne horodatée dans discord.log (à côté du .exe / script)."""
-    try:
-        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
-        with _discord_log_lock:
-            with open(DISCORD_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
-    except Exception:
-        pass
-    if not getattr(sys, "frozen", False):
-        try:
-            print(f"[DISCORD LOG] {msg}")
-        except Exception:
-            pass
-
-
 # Valeurs par défaut (utilisées seulement si absentes du JSON)
 # Dossier d'images par défaut : sous-répertoire "images" du dossier courant (SnowMaster).
 RESOURCES = IMAGES_DIR
@@ -7289,14 +7268,6 @@ class SnowMasterGUI(QWidget):
         # Discord alert config (voyant global rouge)
         discord_cfg = _prefs.get("discord", {})
         self.discord_alert_enabled = bool(discord_cfg.get("enabled", False))
-        try:
-            discord_log(
-                f"--- {APP_DISPLAY_NAME} démarré | discord alert="
-                f"{'ON' if self.discord_alert_enabled else 'OFF'} | "
-                f"log={DISCORD_LOG_PATH} ---"
-            )
-        except Exception:
-            pass
         self._last_auto_relaunch_attempt: Dict[str, float] = {}  # title -> ts
         self._pending_resets: List[str] = []  # Queue de titres à reset
 
@@ -8394,27 +8365,14 @@ class SnowMasterGUI(QWidget):
 
         # Transition vers ROUGE (on ignore la toute première mise à jour au démarrage)
         if (not first) and new_color == CLR_RED and old_color != CLR_RED:
-            discord_log(
-                f"[REDDOT] Transition voyant global → ROUGE (depuis {old_color}) → alerte"
-            )
             try:
                 self._on_global_red_alert()
             except Exception as e:
-                discord_log(f"[REDDOT] Erreur alerte rouge globale: {e}")
                 print(f"[ALERT] erreur alerte rouge globale: {e}")
-        elif first and new_color == CLR_RED:
-            discord_log(
-                "[REDDOT] Voyant global ROUGE au 1er tick (démarrage) → alerte ignorée"
-            )
-        elif (not first) and new_color == CLR_RED and old_color == CLR_RED:
-            discord_log(
-                "[REDDOT] Voyant global déjà ROUGE → pas de nouvelle alerte Discord"
-            )
 
         # Transition vers VERT (UNIQUEMENT depuis ROUGE) - Action Discord
         # Note : Le passage JAUNE → VERT ne déclenche RIEN
         if (not first) and new_color == CLR_GREEN and old_color == CLR_RED:
-            discord_log("[SUCCESS] Transition voyant global ROUGE → VERT")
             app_log_info(
                 f"🔄 Transition ROUGE → VERT détectée (old={old_color}, new={new_color}, first={first})"
             )
@@ -8465,12 +8423,7 @@ class SnowMasterGUI(QWidget):
         try:
             if getattr(self, "discord_alert_enabled", False):
                 send_discord_hook()
-            else:
-                discord_log(
-                    "[REDDOT] Checkbox « Discord alert » décochée → webhook non appelé"
-                )
         except Exception as e:
-            discord_log(f"[REDDOT] Exception lors de l'appel webhook: {e}")
             print(f"[ALERT] discord hook failed: {e}")
 
         # 4) Envoi de l'alerte via le bot Discord (si activé)
@@ -11684,7 +11637,6 @@ def send_discord_hook_success():
     Envoie un webhook Discord simple :
     Embed : 🟢 Tout est revenu au VERT !
     """
-    discord_log("[SUCCESS] Tentative d'envoi webhook vert…")
     # Récupération basique du webhook (à adapter selon ton stockage)
     try:
         discord_cfg = _prefs.get("discord", {})
@@ -11695,7 +11647,6 @@ def send_discord_hook_success():
     enabled = bool(discord_cfg.get("enabled", False))
 
     if not enabled or not webhook_url:
-        discord_log("[SUCCESS] Webhook non configuré ou Discord désactivé → rien envoyé")
         print("[DISCORD SUCCESS] Webhook non configuré / désactivé.")
         return
 
@@ -11726,10 +11677,8 @@ def send_discord_hook_success():
             },
         )
         with urllib.request.urlopen(req, timeout=10.0) as resp:
-            discord_log(f"[SUCCESS] Webhook vert envoyé (HTTP {resp.getcode()})")
             print(f"[DISCORD SUCCESS] ✓ Envoyé (HTTP {resp.getcode()})")
     except Exception as e:
-        discord_log(f"[SUCCESS] Échec envoi webhook vert: {e}")
         print(f"[DISCORD SUCCESS] ✗ Erreur envoi : {e}")
 
 
@@ -11738,7 +11687,6 @@ def send_discord_hook():
     Envoie un webhook Discord compact quand le voyant global passe au rouge.
     Format: une seule instance avec ses sous-contrôleurs en rouge.
     """
-    discord_log("[REDDOT] Tentative d'envoi webhook reddot…")
     print("[DISCORD HOOK] Fonction appelée...")
 
     try:
@@ -11750,11 +11698,9 @@ def send_discord_hook():
     webhook_url = str(discord_cfg.get("webhookreddot") or "").strip()
 
     if not enabled:
-        discord_log("[REDDOT] Discord désactivé dans settings.json → abandon")
         print("[DISCORD HOOK] Discord désactivé dans les préférences")
         return
     if not webhook_url:
-        discord_log("[REDDOT] webhookreddot vide dans settings.json → abandon")
         print("[DISCORD HOOK] Webhook URL vide")
         return
 
@@ -11837,14 +11783,10 @@ def send_discord_hook():
                     main_is_red = False
 
     except Exception as e:
-        discord_log(f"[REDDOT] Erreur analyse instances: {e}")
         print(f"[DISCORD HOOK] Erreur lors de l'analyse: {e}")
         return
 
     if not red_instance_title:
-        discord_log(
-            "[REDDOT] Aucune instance en rouge dans _instances (hors bleues/stoppées) → abandon"
-        )
         print("[DISCORD HOOK] Aucune instance en rouge trouvée")
         return
 
@@ -11871,10 +11813,6 @@ def send_discord_hook():
     if total_red_count > 1:
         description += f"\n+{total_red_count - 1} autre(s)"
 
-    discord_log(
-        f"[REDDOT] Envoi embed instance={red_instance_title!r} "
-        f"total_red={total_red_count} corps={description!r}"
-    )
     print(f"[DISCORD HOOK] Message: {description}")
 
     now_time = datetime.now().strftime("%H:%M:%S")
@@ -11904,7 +11842,6 @@ def send_discord_hook():
         with urllib.request.urlopen(req, timeout=10.0) as resp:
             status = resp.getcode()
             resp.read()
-            discord_log(f"[REDDOT] Webhook envoyé avec succès (HTTP {status})")
             print(f"[DISCORD HOOK] ✓ Envoyé (HTTP {status})")
     except urllib.error.HTTPError as e:
         error_body = ""
@@ -11912,11 +11849,9 @@ def send_discord_hook():
             error_body = e.read().decode("utf-8")
         except Exception:
             pass
-        discord_log(f"[REDDOT] Échec HTTP {e.code}: {error_body}")
         print(f"[DISCORD HOOK] ✗ HTTP {e.code}: {error_body}")
         app_log_warn(f"[DISCORD HOOK] HTTP {e.code}: {error_body}")
     except Exception as e:
-        discord_log(f"[REDDOT] Échec envoi: {e}")
         print(f"[DISCORD HOOK] ✗ Erreur: {e}")
         app_log_warn(f"[DISCORD HOOK] envoi échoué: {e}")
 
